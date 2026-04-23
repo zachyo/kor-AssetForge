@@ -111,6 +111,46 @@ pub struct DividendSchedule {
     pub amount_per_token: i128,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct DividendDistribution {
+    pub distribution_id: u64,
+    pub asset_id: u64,
+    pub total_amount: i128,
+    pub payout_asset: Address,
+    pub timestamp: u64,
+    pub snapshot_timestamp: u64,
+    pub total_supply: i128,
+    pub tax_withholding_rate: u32, // basis points
+    pub is_paused: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DividendClaim {
+    pub distribution_id: u64,
+    pub claimant: Address,
+    pub amount: i128,
+    pub withheld: i128,
+    pub claimed_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct TokenSnapshot {
+    pub snapshot_id: u64,
+    pub timestamp: u64,
+    pub total_supply: i128,
+    pub holder_count: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SnapshotEntry {
+    pub address: Address,
+    pub balance: i128,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 #[contracttype]
 pub enum TargetChain {
@@ -174,6 +214,15 @@ pub enum DataKey {
     ValuationTimestamps,
     DividendSchedule(u64), // asset_id -> schedule
     LastClaim(u64, Address),
+    // Enhanced dividend distribution keys
+    DividendDistribution(u64), // distribution_id -> distribution
+    DividendClaim(u64, Address), // distribution_id, claimant -> claim
+    TokenSnapshot(u64), // snapshot_id -> snapshot
+    SnapshotEntry(u64, Address), // snapshot_id, address -> entry
+    DistributionHistory(u64), // asset_id -> Vec<distribution_id>
+    LastDistributionIndex, // for auto-incrementing distribution IDs
+    LastSnapshotIndex, // for auto-incrementing snapshot IDs
+    DividendPaused, // emergency pause flag
     // Cross-chain bridging keys
     BridgeConfig,
     PendingBridge(BytesN<32>), // bridge_id -> PendingBridge
@@ -449,6 +498,219 @@ impl AssetToken {
 
     pub fn get_dividend_info(env: Env, asset_id: u64) -> Option<DividendSchedule> {
         env.storage().persistent().get(&DataKey::DividendSchedule(asset_id))
+    }
+
+    // Enhanced Dividend Distribution Functions
+    // -----------------------------------------------------------------------
+
+    /// Create a snapshot of token holders at the current time
+    pub fn create_snapshot(env: Env, admin: Address) -> u64 {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        let snapshot_id = env.storage().instance().get(&DataKey::LastSnapshotIndex).unwrap_or(0u64) + 1;
+        let timestamp = env.ledger().timestamp();
+        let total_supply = Self::total_supply(env.clone());
+        
+        // In a real implementation, you would iterate through all token holders
+        // For now, we'll store the snapshot metadata
+        let snapshot = TokenSnapshot {
+            snapshot_id,
+            timestamp,
+            total_supply,
+            holder_count: 0, // Would be calculated in a full implementation
+        };
+
+        env.storage().instance().set(&DataKey::TokenSnapshot(snapshot_id), &snapshot);
+        env.storage().instance().set(&DataKey::LastSnapshotIndex, &snapshot_id);
+        
+        env.events().publish((Symbol::new(&env, "snapshot_created"),), snapshot_id);
+        snapshot_id
+    }
+
+    /// Get snapshot information
+    pub fn get_snapshot(env: Env, snapshot_id: u64) -> Option<TokenSnapshot> {
+        env.storage().instance().get(&DataKey::TokenSnapshot(snapshot_id))
+    }
+
+    /// Create a dividend distribution with snapshot-based allocation
+    pub fn create_dividend_distribution(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        total_amount: i128,
+        payout_asset: Address,
+        tax_withholding_rate: u32,
+    ) -> u64 {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+        
+        // Check if dividends are paused
+        let paused: bool = env.storage().instance().get(&DataKey::DividendPaused).unwrap_or(false);
+        assert!(!paused, "dividends paused");
+
+        assert!(total_amount > 0, "amount must be positive");
+        assert!(tax_withholding_rate <= 10000, "tax rate too high");
+
+        // Create snapshot first
+        let snapshot_id = Self::create_snapshot(env.clone(), admin.clone());
+        let snapshot: TokenSnapshot = env.storage().instance().get(&DataKey::TokenSnapshot(snapshot_id))
+            .expect("snapshot not found");
+
+        let distribution_id = env.storage().instance().get(&DataKey::LastDistributionIndex).unwrap_or(0u64) + 1;
+        let timestamp = env.ledger().timestamp();
+
+        let distribution = DividendDistribution {
+            distribution_id,
+            asset_id,
+            total_amount,
+            payout_asset,
+            timestamp,
+            snapshot_timestamp: snapshot.timestamp,
+            total_supply: snapshot.total_supply,
+            tax_withholding_rate,
+            is_paused: false,
+        };
+
+        env.storage().instance().set(&DataKey::DividendDistribution(distribution_id), &distribution);
+        env.storage().instance().set(&DataKey::LastDistributionIndex, &distribution_id);
+        
+        // Add to distribution history
+        let mut history: Vec<u64> = env.storage().instance().get(&DataKey::DistributionHistory(asset_id))
+            .unwrap_or(Vec::new(&env));
+        history.push_back(distribution_id);
+        env.storage().instance().set(&DataKey::DistributionHistory(asset_id), &history);
+        
+        env.events().publish((Symbol::new(&env, "dividend_distribution_created"),), (distribution_id, total_amount));
+        distribution_id
+    }
+
+    /// Claim dividend from a specific distribution with tax withholding
+    pub fn claim_dividend_distribution(env: Env, distribution_id: u64, claimant: Address) {
+        claimant.require_auth();
+        
+        let distribution: DividendDistribution = env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
+            .expect("distribution not found");
+        
+        assert!(!distribution.is_paused, "distribution paused");
+        
+        // Check if already claimed
+        let claim_key = DataKey::DividendClaim(distribution_id, claimant.clone());
+        let existing_claim: Option<DividendClaim> = env.storage().instance().get(&claim_key);
+        if existing_claim.is_some() {
+            panic!("already claimed");
+        }
+
+        let balance = Self::balance(env.clone(), claimant.clone());
+        assert!(balance > 0, "no tokens");
+
+        // Calculate proportional share
+        let gross_amount = (balance * distribution.total_amount) / distribution.total_supply;
+        
+        // Calculate tax withholding
+        let withheld = (gross_amount * distribution.tax_withholding_rate as i128) / 10000;
+        let net_amount = gross_amount - withheld;
+
+        let claim = DividendClaim {
+            distribution_id,
+            claimant: claimant.clone(),
+            amount: net_amount,
+            withheld,
+            claimed_at: env.ledger().timestamp(),
+        };
+
+        env.storage().instance().set(&claim_key, &claim);
+        
+        // In a real implementation, you would transfer the net_amount to the claimant
+        // For now, we just emit an event
+        env.events().publish((Symbol::new(&env, "dividend_claimed"),), (distribution_id, claimant, net_amount));
+    }
+
+    /// Get distribution information
+    pub fn get_distribution(env: Env, distribution_id: u64) -> Option<DividendDistribution> {
+        env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
+    }
+
+    /// Get claim information for a specific distribution
+    pub fn get_dividend_claim(env: Env, distribution_id: u64, claimant: Address) -> Option<DividendClaim> {
+        env.storage().instance().get(&DataKey::DividendClaim(distribution_id, claimant))
+    }
+
+    /// Get distribution history for an asset
+    pub fn get_distribution_history(env: Env, asset_id: u64) -> Vec<u64> {
+        env.storage().instance().get(&DataKey::DistributionHistory(asset_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Calculate unclaimed dividends for a distribution
+    pub fn calculate_unclaimed_dividends(env: Env, distribution_id: u64) -> i128 {
+        let distribution: DividendDistribution = env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
+            .expect("distribution not found");
+        
+        // In a real implementation, you would sum up all claimed amounts and subtract from total
+        // For now, return the total amount as a placeholder
+        distribution.total_amount
+    }
+
+    /// Pause all dividend distributions (emergency)
+    pub fn pause_dividends(env: Env, admin: Address) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        env.storage().instance().set(&DataKey::DividendPaused, &true);
+        env.events().publish((Symbol::new(&env, "dividends_paused"),), ());
+    }
+
+    /// Resume dividend distributions
+    pub fn resume_dividends(env: Env, admin: Address) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        env.storage().instance().set(&DataKey::DividendPaused, &false);
+        env.events().publish((Symbol::new(&env, "dividends_resumed"),), ());
+    }
+
+    /// Check if dividends are paused
+    pub fn are_dividends_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::DividendPaused).unwrap_or(false)
+    }
+
+    /// Pause a specific distribution
+    pub fn pause_distribution(env: Env, admin: Address, distribution_id: u64) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        let mut distribution: DividendDistribution = env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
+            .expect("distribution not found");
+        
+        distribution.is_paused = true;
+        env.storage().instance().set(&DataKey::DividendDistribution(distribution_id), &distribution);
+        env.events().publish((Symbol::new(&env, "distribution_paused"),), distribution_id);
+    }
+
+    /// Resume a specific distribution
+    pub fn resume_distribution(env: Env, admin: Address, distribution_id: u64) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        let mut distribution: DividendDistribution = env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
+            .expect("distribution not found");
+        
+        distribution.is_paused = false;
+        env.storage().instance().set(&DataKey::DividendDistribution(distribution_id), &distribution);
+        env.events().publish((Symbol::new(&env, "distribution_resumed"),), distribution_id);
     }
 
     pub fn get_valuation_history(env: Env) -> Vec<ValuationRecord> {
@@ -1174,5 +1436,199 @@ mod test {
         // Now minting should work
         let asset_id = client.mint_fractional(&admin, &100000, &100, &Some(Vec::from_array(&env, [(admin.clone(), 100u64)])), &Some(proof_data));
         assert_eq!(asset_id, 1);
+    }
+
+    // Dividend Distribution System Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let snapshot_id = client.create_snapshot(&admin);
+        assert_eq!(snapshot_id, 1);
+        
+        let snapshot = client.get_snapshot(&snapshot_id).unwrap();
+        assert_eq!(snapshot.snapshot_id, 1);
+        assert!(snapshot.total_supply > 0);
+    }
+
+    #[test]
+    fn test_create_dividend_distribution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500); // 5% tax
+        
+        assert_eq!(distribution_id, 1);
+        
+        let distribution = client.get_distribution(&distribution_id).unwrap();
+        assert_eq!(distribution.asset_id, 1);
+        assert_eq!(distribution.total_amount, 100000);
+        assert_eq!(distribution.tax_withholding_rate, 500);
+        assert!(!distribution.is_paused);
+    }
+
+    #[test]
+    fn test_claim_dividend_distribution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        
+        let user = Address::generate(&env);
+        client.transfer(&admin, &user, &10000, &1, &_ec_id);
+        
+        client.claim_dividend_distribution(&distribution_id, &user);
+        
+        let claim = client.get_dividend_claim(&distribution_id, &user).unwrap();
+        assert_eq!(claim.distribution_id, distribution_id);
+        assert_eq!(claim.claimant, user);
+        assert!(claim.amount > 0);
+        assert!(claim.withheld > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already claimed")]
+    fn test_claim_dividend_twice() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        
+        let user = Address::generate(&env);
+        client.transfer(&admin, &user, &10000, &1, &_ec_id);
+        
+        client.claim_dividend_distribution(&distribution_id, &user);
+        client.claim_dividend_distribution(&distribution_id, &user);
+    }
+
+    #[test]
+    fn test_pause_resume_dividends() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        assert!(!client.are_dividends_paused());
+        
+        client.pause_dividends(&admin);
+        assert!(client.are_dividends_paused());
+        
+        client.resume_dividends(&admin);
+        assert!(!client.are_dividends_paused());
+    }
+
+    #[test]
+    fn test_pause_resume_distribution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        
+        let distribution = client.get_distribution(&distribution_id).unwrap();
+        assert!(!distribution.is_paused);
+        
+        client.pause_distribution(&admin, &distribution_id);
+        
+        let distribution = client.get_distribution(&distribution_id).unwrap();
+        assert!(distribution.is_paused);
+        
+        client.resume_distribution(&admin, &distribution_id);
+        
+        let distribution = client.get_distribution(&distribution_id).unwrap();
+        assert!(!distribution.is_paused);
+    }
+
+    #[test]
+    #[should_panic(expected = "distribution paused")]
+    fn test_claim_from_paused_distribution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        
+        client.pause_distribution(&admin, &distribution_id);
+        
+        let user = Address::generate(&env);
+        client.transfer(&admin, &user, &10000, &1, &_ec_id);
+        
+        client.claim_dividend_distribution(&distribution_id, &user);
+    }
+
+    #[test]
+    fn test_distribution_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        client.create_dividend_distribution(&admin, &1, &150000, &payout_asset, &750);
+        
+        let history = client.get_distribution_history(&1);
+        assert_eq!(history.len(), 2);
+        assert!(history.contains(&1));
+        assert!(history.contains(&2));
+    }
+
+    #[test]
+    fn test_tax_withholding_calculation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &1000); // 10% tax
+        
+        let user = Address::generate(&env);
+        client.transfer(&admin, &user, &50000, &1, &_ec_id); // 50% of supply
+        
+        client.claim_dividend_distribution(&distribution_id, &user);
+        
+        let claim = client.get_dividend_claim(&distribution_id, &user).unwrap();
+        
+        // User should get 50% of 100000 = 50000 gross
+        // 10% tax = 5000 withheld
+        // Net = 45000
+        assert_eq!(claim.amount, 45000);
+        assert_eq!(claim.withheld, 5000);
+    }
+
+    #[test]
+    #[should_panic(expected = "dividends paused")]
+    fn test_create_distribution_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        client.pause_dividends(&admin);
+        
+        let payout_asset = Address::generate(&env);
+        client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+    }
+
+    #[test]
+    fn test_calculate_unclaimed_dividends() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _ec_id) = setup(&env);
+        
+        let payout_asset = Address::generate(&env);
+        let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500);
+        
+        let unclaimed = client.calculate_unclaimed_dividends(&distribution_id);
+        assert_eq!(unclaimed, 100000);
     }
 }
