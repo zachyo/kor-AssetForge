@@ -140,6 +140,8 @@ impl Marketplace {
         emergency_control_id: Address,
         governance_id: Option<Address>,
     ) -> u64 {
+        assert!(amount > 0, "amount must be positive");
+        assert!(price > 0, "price must be positive");
         seller.require_auth();
 
         // Enforce pause check for trading operations
@@ -179,6 +181,7 @@ impl Marketplace {
         asset_id: u64,
         emergency_control_id: Address,
     ) -> bool {
+        assert!(amount > 0, "amount must be positive");
         buyer.require_auth();
 
         // Enforce pause check for trading operations
@@ -418,7 +421,8 @@ impl Marketplace {
         let fee = trade_amount
             .checked_mul(config.fee_bps as i128)
             .expect("fee calculation overflow")
-            / 10_000;
+            .checked_div(10_000)
+            .expect("fee calculation div error");
 
         if fee > 0 {
             let current: i128 = env
