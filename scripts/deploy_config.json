@@ -1,0 +1,53 @@
+{
+  "contracts": [
+    {
+      "name": "AssetToken",
+      "wasm_file": "kor_assetforge_contracts.wasm",
+      "init_function": "initialize",
+      "init_args": {
+        "admin": "deployer"
+      },
+      "depends_on": []
+    },
+    {
+      "name": "Marketplace", 
+      "wasm_file": "kor_assetforge_contracts.wasm",
+      "init_function": "initialize",
+      "init_args": {
+        "admin": "deployer",
+        "asset_contract": "{{AssetToken}}"
+      },
+      "depends_on": ["AssetToken"]
+    },
+    {
+      "name": "Governance",
+      "wasm_file": "kor_assetforge_contracts.wasm", 
+      "init_function": "initialize",
+      "init_args": {
+        "admin": "deployer"
+      },
+      "depends_on": []
+    },
+    {
+      "name": "EmergencyControl",
+      "wasm_file": "kor_assetforge_contracts.wasm",
+      "init_function": "initialize", 
+      "init_args": {
+        "admin": "deployer"
+      },
+      "depends_on": []
+    }
+  ],
+  "networks": {
+    "testnet": {
+      "rpc_url": "https://soroban-testnet.stellar.org:443",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "friendbot_url": "https://friendbot.stellar.org"
+    },
+    "mainnet": {
+      "rpc_url": "https://soroban.stellar.org:443", 
+      "network_passphrase": "Public Global Stellar Network ; September 2015",
+      "friendbot_url": null
+    }
+  }
+}
