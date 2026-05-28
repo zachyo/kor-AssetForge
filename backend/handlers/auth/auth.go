@@ -95,6 +95,16 @@ type ResetPasswordRequest struct {
 }
 
 // Register handles user registration
+// @Summary Register a new user
+// @Description Create a new user account with Stellar address and email
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param register body auth.RegisterRequest true "Registration details"
+// @Success 201 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 409 {object} apperrors.ErrorResponse
+// @Router /auth/register [post]
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -139,6 +149,17 @@ func (h *AuthHandler) Register(c *gin.Context) {
 }
 
 // Login handles user authentication
+// @Summary Login a user
+// @Description Authenticate a user and receive access and refresh tokens
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param login body auth.LoginRequest true "Login credentials"
+// @Success 200 {object} auth.TokenResponse
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 401 {object} apperrors.ErrorResponse
+// @Failure 403 {object} apperrors.ErrorResponse
+// @Router /auth/login [post]
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -194,6 +215,16 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 // RefreshToken handles token refresh
+// @Summary Refresh access token
+// @Description Use a refresh token to obtain a new access token
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param refresh body auth.RefreshTokenRequest true "Refresh token request"
+// @Success 200 {object} auth.TokenResponse
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 401 {object} apperrors.ErrorResponse
+// @Router /auth/refresh [post]
 func (h *AuthHandler) RefreshToken(c *gin.Context) {
 	var req RefreshTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -243,6 +274,15 @@ func (h *AuthHandler) RefreshToken(c *gin.Context) {
 }
 
 // VerifyEmail handles email verification
+// @Summary Verify email address
+// @Description Verify a user's email address using a provided token
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param verify body auth.VerifyEmailRequest true "Email verification token"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Router /auth/verify-email [post]
 func (h *AuthHandler) VerifyEmail(c *gin.Context) {
 	var req VerifyEmailRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -268,6 +308,14 @@ func (h *AuthHandler) VerifyEmail(c *gin.Context) {
 }
 
 // ForgotPassword handles forgot password requests
+// @Summary Request password reset
+// @Description Request a password reset link to be sent to the user's email
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param forgot_password body auth.ForgotPasswordRequest true "Email for password reset"
+// @Success 200 {object} map[string]string
+// @Router /auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c *gin.Context) {
 	var req ForgotPasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -293,6 +341,15 @@ func (h *AuthHandler) ForgotPassword(c *gin.Context) {
 }
 
 // ResetPassword handles password reset
+// @Summary Reset password
+// @Description Reset user password using a provided token
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param reset_password body auth.ResetPasswordRequest true "Password reset details"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Router /auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c *gin.Context) {
 	var req ResetPasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -327,6 +384,13 @@ func (h *AuthHandler) ResetPassword(c *gin.Context) {
 }
 
 // Logout handles user logout
+// @Summary Logout user
+// @Description Invalidate the current user's session
+// @Tags auth
+// @Security BearerAuth
+// @Success 200 {object} map[string]string
+// @Failure 401 {object} apperrors.ErrorResponse
+// @Router /auth/logout [post]
 func (h *AuthHandler) Logout(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -343,6 +407,14 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 }
 
 // GetProfile returns the current user's profile
+// @Summary Get user profile
+// @Description Get the profile information of the currently authenticated user
+// @Tags auth
+// @Security BearerAuth
+// @Success 200 {object} auth.UserInfo
+// @Failure 401 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Router /profile [get]
 func (h *AuthHandler) GetProfile(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {

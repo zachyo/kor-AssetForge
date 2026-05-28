@@ -40,11 +40,12 @@ func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClien
 // @Tags assets
 // @Accept json
 // @Produce json
-// @Param asset body object true "Asset creation details"
+// @Param asset body validator.TokenizeAssetRequest true "Asset creation details"
 // @Success 201 {object} models.Asset
-// @Failure 400 {object} map[string]interface{}
-// @Failure 500 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
 // @Router /assets/tokenize [post]
+// @Router /assets [post]
 func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 	var req validator.TokenizeAssetRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -116,7 +117,7 @@ func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 // @Param page query int false "Page number" default(1)
 // @Param limit query int false "Page size" default(10)
 // @Success 200 {object} utils.Pagination
-// @Failure 500 {object} map[string]interface{}
+// @Failure 500 {object} apperrors.ErrorResponse
 // @Router /assets [get]
 func (h *AssetHandler) ListAssets(c *gin.Context) {
 	cacheKey := "kor:asset:list:page1"
@@ -179,7 +180,8 @@ func (h *AssetHandler) ListAssets(c *gin.Context) {
 // @Param limit query int false "Page size" default(10)
 // @Param asset_id query int false "Filter by asset ID"
 // @Success 200 {object} utils.Pagination
-// @Failure 500 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
 // @Router /transactions [get]
 func (h *AssetHandler) ListTransactions(c *gin.Context) {
 	var queryParams validator.TransactionQuery
@@ -221,7 +223,7 @@ func (h *AssetHandler) ListTransactions(c *gin.Context) {
 // @Produce json
 // @Param id path int true "Asset ID"
 // @Success 200 {object} models.Asset
-// @Failure 404 {object} map[string]interface{}
+// @Failure 404 {object} apperrors.ErrorResponse
 // @Router /assets/{id} [get]
 func (h *AssetHandler) GetAsset(c *gin.Context) {
 	var uri validator.AssetIDUri
@@ -270,10 +272,11 @@ func (h *AssetHandler) GetAsset(c *gin.Context) {
 // @Tags marketplace
 // @Accept json
 // @Produce json
-// @Param listing body object true "Listing details"
+// @Param listing body validator.ListAssetSaleRequest true "Listing details"
 // @Success 201 {object} models.Listing
-// @Failure 400 {object} map[string]interface{}
-// @Failure 500 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
 // @Router /marketplace/list [post]
 func (h *AssetHandler) ListAssetForSale(c *gin.Context) {
 	var req validator.ListAssetSaleRequest
@@ -327,10 +330,11 @@ func (h *AssetHandler) ListAssetForSale(c *gin.Context) {
 // @Tags marketplace
 // @Accept json
 // @Produce json
-// @Param transfer body object true "Transfer details"
+// @Param transfer body validator.TransferAssetRequest true "Transfer details"
 // @Success 200 {object} models.Transaction
-// @Failure 400 {object} map[string]interface{}
-// @Failure 500 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
 // @Router /marketplace/transfer [post]
 func (h *AssetHandler) TransferAsset(c *gin.Context) {
 	var req validator.TransferAssetRequest

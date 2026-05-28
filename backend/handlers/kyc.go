@@ -68,8 +68,18 @@ type kycWebhookPayload struct {
 // ---- endpoints --------------------------------------------------------------
 
 // SubmitKYC handles POST /api/v1/kyc/submit
-// Initiates KYC verification for a user by calling the provider and creating
-// a KYCRecord with status=pending.
+// @Summary Submit KYC verification
+// @Description Initiates KYC verification for a user by calling the provider and creating a KYCRecord with status=pending.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param submit body submitKYCRequest true "KYC submission details"
+// @Success 201 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 409 {object} apperrors.ErrorResponse
+// @Failure 502 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /kyc/submit [post]
 func (h *KYCHandler) SubmitKYC(c *gin.Context) {
 	var req submitKYCRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -128,7 +138,16 @@ func (h *KYCHandler) SubmitKYC(c *gin.Context) {
 }
 
 // GetKYCStatus handles GET /api/v1/kyc/status?user_id=<n>
-// Polls the provider for the latest status and updates the local record.
+// @Summary Get KYC status
+// @Description Polls the provider for the latest status and updates the local record.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param user_id query uint true "User ID"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Router /kyc/status [get]
 func (h *KYCHandler) GetKYCStatus(c *gin.Context) {
 	userIDStr := c.Query("user_id")
 	if userIDStr == "" {
@@ -187,8 +206,17 @@ func (h *KYCHandler) GetKYCStatus(c *gin.Context) {
 }
 
 // UploadDocument handles POST /api/v1/kyc/documents
-// Records document metadata. Actual binary upload goes to object storage
-// (mocked here — StoragePath is set to a deterministic placeholder).
+// @Summary Upload KYC document
+// @Description Records document metadata. Actual binary upload goes to object storage.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param document body uploadDocumentRequest true "Document upload details"
+// @Success 201 {object} models.KYCDocument
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /kyc/documents [post]
 func (h *KYCHandler) UploadDocument(c *gin.Context) {
 	var req uploadDocumentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -230,7 +258,18 @@ func (h *KYCHandler) UploadDocument(c *gin.Context) {
 }
 
 // ScreenAML handles POST /api/v1/kyc/aml/screen
-// Triggers AML screening via the provider and persists the result.
+// @Summary Screen for AML
+// @Description Triggers AML screening via the provider and persists the result.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param aml_screen body amlScreenRequest true "AML screening request"
+// @Success 201 {object} models.AMLScreening
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Failure 502 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /kyc/aml/screen [post]
 func (h *KYCHandler) ScreenAML(c *gin.Context) {
 	var req amlScreenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -278,6 +317,16 @@ func (h *KYCHandler) ScreenAML(c *gin.Context) {
 }
 
 // VerifyAccreditedInvestor handles POST /api/v1/kyc/accredited
+// @Summary Verify accredited investor
+// @Description Verifies if a user is an accredited investor based on net worth.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param accredited_investor body accreditedInvestorRequest true "Accredited investor verification request"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 502 {object} apperrors.ErrorResponse
+// @Router /kyc/accredited [post]
 func (h *KYCHandler) VerifyAccreditedInvestor(c *gin.Context) {
 	var req accreditedInvestorRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -304,6 +353,16 @@ func (h *KYCHandler) VerifyAccreditedInvestor(c *gin.Context) {
 }
 
 // GetAuditLog handles GET /api/v1/kyc/audit?user_id=<n>
+// @Summary Get KYC audit log
+// @Description Retrieves a list of compliance audit logs for a specific user.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param user_id query uint true "User ID"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /kyc/audit [get]
 func (h *KYCHandler) GetAuditLog(c *gin.Context) {
 	var userID uint
 	if _, err := fmt.Sscanf(c.Query("user_id"), "%d", &userID); err != nil || userID == 0 {
@@ -322,7 +381,13 @@ func (h *KYCHandler) GetAuditLog(c *gin.Context) {
 }
 
 // ComplianceReport handles GET /api/v1/compliance/report
-// Returns aggregate compliance statistics for regulatory reporting.
+// @Summary Get compliance report
+// @Description Returns aggregate compliance statistics for regulatory reporting.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /compliance/report [get]
 func (h *KYCHandler) ComplianceReport(c *gin.Context) {
 	type report struct {
 		TotalKYCRecords   int64 `json:"total_kyc_records"`
@@ -348,7 +413,16 @@ func (h *KYCHandler) ComplianceReport(c *gin.Context) {
 }
 
 // HandleKYCWebhook handles POST /webhooks/kyc
-// Receives status update callbacks from the KYC provider.
+// @Summary Handle KYC webhook
+// @Description Receives status update callbacks from the KYC provider.
+// @Tags kyc
+// @Accept json
+// @Produce json
+// @Param webhook body kycWebhookPayload true "KYC webhook payload"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 404 {object} apperrors.ErrorResponse
+// @Router /webhooks/kyc [post]
 func (h *KYCHandler) HandleKYCWebhook(c *gin.Context) {
 	var payload kycWebhookPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {

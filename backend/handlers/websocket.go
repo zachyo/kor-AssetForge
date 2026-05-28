@@ -301,6 +301,11 @@ func (wsh *WebSocketHandler) handleClientMessage(sub *subscriber, raw []byte) {
 }
 
 // HandleWSStats returns live hub metrics.
+// @Summary Get WebSocket stats
+// @Description Returns live metrics about the WebSocket hub.
+// @Tags websocket
+// @Success 200 {object} WSStats
+// @Router /ws/stats [get]
 func (wsh *WebSocketHandler) HandleWSStats(c *gin.Context) {
 	hub := GetHub()
 	c.JSON(http.StatusOK, WSStats{

@@ -23,18 +23,24 @@ func NewSearchHandler(backend services.SearchBackend) *SearchHandler {
 }
 
 // Search handles GET /api/v1/search/assets
-//
-// Query params:
-//
-//	q          – free-text search term (name / symbol / description / asset_type)
-//	asset_type – exact match filter
-//	min_price  – minimum listing price_per_unit (stroops)
-//	max_price  – maximum listing price_per_unit (stroops)
-//	verified   – "true" or "false"
-//	sort_by    – name | created_at | total_supply | fractions  (default: created_at)
-//	order      – asc | desc  (default: desc)
-//	page       – 1-based page number (default: 1)
-//	limit      – page size 1-100 (default: 10)
+// @Summary Search assets
+// @Description Perform a full-text search on assets with various filters
+// @Tags search
+// @Accept json
+// @Produce json
+// @Param q query string false "Search term"
+// @Param asset_type query string false "Filter by asset type"
+// @Param min_price query float64 false "Minimum price"
+// @Param max_price query float64 false "Maximum price"
+// @Param verified query boolean false "Filter by verified status"
+// @Param sort_by query string false "Sort field"
+// @Param order query string false "Sort order"
+// @Param page query int false "Page number"
+// @Param limit query int false "Page size"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /search/assets [get]
 func (sh *SearchHandler) Search(c *gin.Context) {
 	var req services.SearchRequest
 	if err := c.ShouldBindQuery(&req); err != nil {
@@ -60,11 +66,17 @@ func (sh *SearchHandler) Search(c *gin.Context) {
 }
 
 // Suggest handles GET /api/v1/search/suggestions
-//
-// Query params:
-//
-//	q     – prefix to auto-complete (required)
-//	limit – max suggestions returned (default: 10, max: 20)
+// @Summary Suggest search terms
+// @Description Get auto-complete suggestions based on a search prefix
+// @Tags search
+// @Accept json
+// @Produce json
+// @Param q query string true "Search prefix"
+// @Param limit query int false "Max suggestions"
+// @Success 200 {object} []string
+// @Failure 400 {object} apperrors.ErrorResponse
+// @Failure 500 {object} apperrors.ErrorResponse
+// @Router /search/suggestions [get]
 func (sh *SearchHandler) Suggest(c *gin.Context) {
 	query := c.Query("q")
 	if query == "" {
@@ -88,7 +100,13 @@ func (sh *SearchHandler) Suggest(c *gin.Context) {
 }
 
 // SearchAnalytics handles GET /api/v1/search/analytics
-// Returns the last N recorded search events for observability.
+// @Summary Get search analytics
+// @Description Returns the last N recorded search events for observability.
+// @Tags search
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /search/analytics [get]
 func (sh *SearchHandler) SearchAnalytics(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"events": sh.analytics,
