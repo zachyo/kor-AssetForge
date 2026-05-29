@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/yourusername/kor-assetforge/apperrors"
 	"github.com/yourusername/kor-assetforge/models"
+	"github.com/yourusername/kor-assetforge/services"
 	"github.com/yourusername/kor-assetforge/utils"
 	"github.com/yourusername/kor-assetforge/validator"
 	"gorm.io/gorm"
@@ -24,13 +25,15 @@ type AssetHandler struct {
 	db            *gorm.DB
 	stellarClient *utils.StellarClient
 	redisClient   *redis.Client
+	emailService  services.EmailService
 }
 
-func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClient *redis.Client) *AssetHandler {
+func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClient *redis.Client, emailService services.EmailService) *AssetHandler {
 	return &AssetHandler{
 		db:            db,
 		stellarClient: stellarClient,
 		redisClient:   redisClient,
+		emailService:  emailService,
 	}
 }
 
@@ -367,6 +370,12 @@ func (h *AssetHandler) TransferAsset(c *gin.Context) {
 		return
 	}
 
+	if h.emailService != nil {
+		if err := h.notifyTransactionParticipants(&transaction); err != nil {
+			log.Printf("failed to queue transaction confirmation email: %v", err)
+		}
+	}
+
 	if h.redisClient != nil {
 		ctx := context.Background()
 		detailKey := fmt.Sprintf("kor:asset:detail:%d", req.AssetID)
@@ -376,4 +385,22 @@ func (h *AssetHandler) TransferAsset(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, transaction)
+}
+
+func (h *AssetHandler) notifyTransactionParticipants(transaction *models.Transaction) error {
+	participants := map[string]struct{}{}
+	for _, addr := range []string{transaction.FromAddress, transaction.ToAddress} {
+		participants[addr] = struct{}{}
+	}
+
+	for addr := range participants {
+		var user models.User
+		if err := h.db.Select("email", "username").Where("stellar_address = ?", addr).First(&user).Error; err != nil {
+			continue
+		}
+		if err := h.emailService.SendTransactionConfirmation(user.Email, user.Username, transaction.TxHash, transaction.Amount, transaction.AssetID, transaction.FromAddress, transaction.ToAddress); err != nil {
+			return err
+		}
+	}
+	return nil
 }

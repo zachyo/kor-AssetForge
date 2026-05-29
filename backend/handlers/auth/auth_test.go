@@ -56,7 +56,7 @@ func (suite *AuthTestSuite) SetupSuite() {
 		BcryptCost:         4,
 	}
 
-	handler := NewAuthHandler(db, config)
+	handler := NewAuthHandler(db, config, nil)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
