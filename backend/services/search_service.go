@@ -2,10 +2,14 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/yourusername/kor-assetforge/models"
+
+	"github.com/elastic/go-elasticsearch/v8/typesapi"
 	"gorm.io/gorm"
 )
 
@@ -51,20 +55,27 @@ type SuggestResult struct {
 
 // SearchAnalyticsEvent is appended to the analytics log on every search.
 type SearchAnalyticsEvent struct {
-	Query      string         `json:"query"`
-	Filters    map[string]interface{} `json:"filters"`
-	ResultCount int64         `json:"result_count"`
-	TookMs     float64        `json:"took_ms"`
+	EventID     string                 `json:"event_id"`
+	Query       string                 `json:"query"`
+	Filters     map[string]interface{} `json:"filters"`
+	ResultCount int64                  `json:"result_count"`
+	TookMs      float64                `json:"took_ms"`
+	UserID      string                 `json:"user_id,omitempty"`
+	Timestamp   time.Time              `json:"timestamp"`
 }
 
 // ---- SearchBackend interface -------------------------------------------------
 
 // SearchBackend abstracts the underlying search engine.
-// DBSearchBackend (PostgreSQL) is the default; ESSearchBackend is the mock
-// Elasticsearch adapter that falls back to DB when ES is unavailable.
+// DBSearchBackend (PostgreSQL) is the default; ESSearchBackend integrates
+// Elasticsearch with transparent fallback to DB when ES is unavailable.
 type SearchBackend interface {
 	Search(ctx context.Context, req *SearchRequest) (*SearchResult, error)
 	Suggest(ctx context.Context, query string, limit int) (*SuggestResult, error)
+	IndexAsset(ctx context.Context, asset *models.Asset) error
+	DeleteAssetFromIndex(ctx context.Context, assetID uint) error
+	ReindexAll(ctx context.Context) error
+	RecordAnalytics(ctx context.Context, event *SearchAnalyticsEvent) error
 }
 
 // ---- DBSearchBackend --------------------------------------------------------
@@ -213,40 +224,481 @@ func (s *DBSearchBackend) buildFacets(ctx context.Context, req *SearchRequest) S
 	}
 }
 
-// ---- ESSearchBackend (mock Elasticsearch adapter) ---------------------------
-
-// ESSearchBackend is a mock adapter that demonstrates how Elasticsearch would
-// be integrated. When ES is unreachable it transparently falls back to the
-// DBSearchBackend, so the API remains fully functional without a running ES
-// cluster. In production, replace the fallback with a real ES client call.
-type ESSearchBackend struct {
-	baseURL string
-	db      SearchBackend // fallback
+// IndexAsset is a no-op for the DB backend
+func (s *DBSearchBackend) IndexAsset(ctx context.Context, asset *models.Asset) error {
+	return nil
 }
 
-// NewESSearchBackend creates an ESSearchBackend that delegates to db when ES
-// is not configured or unavailable.
-func NewESSearchBackend(esBaseURL string, db *gorm.DB) SearchBackend {
-	return &ESSearchBackend{
-		baseURL: esBaseURL,
-		db:      NewDBSearchBackend(db),
+// DeleteAssetFromIndex is a no-op for the DB backend
+func (s *DBSearchBackend) DeleteAssetFromIndex(ctx context.Context, assetID uint) error {
+	return nil
+}
+
+// ReindexAll is a no-op for the DB backend
+func (s *DBSearchBackend) ReindexAll(ctx context.Context) error {
+	return nil
+}
+
+// RecordAnalytics is a no-op for the DB backend
+func (s *DBSearchBackend) RecordAnalytics(ctx context.Context, event *SearchAnalyticsEvent) error {
+	return nil
+}
+
+// ---- ESSearchBackend (Elasticsearch adapter) --------------------------------
+
+// AssetDocument represents how an asset is indexed in Elasticsearch
+type AssetDocument struct {
+	ID            uint                   `json:"id"`
+	Name          string                 `json:"name"`
+	Symbol        string                 `json:"symbol"`
+	Description   string                 `json:"description"`
+	AssetType     string                 `json:"asset_type"`
+	TotalSupply   int64                  `json:"total_supply"`
+	Fractions     uint64                 `json:"fractions"`
+	ContractID    string                 `json:"contract_id"`
+	OwnerAddress  string                 `json:"owner_address"`
+	Metadata      map[string]string      `json:"metadata"`
+	ImageURL      string                 `json:"image_url"`
+	DocumentURL   string                 `json:"document_url"`
+	Verified      bool                   `json:"verified"`
+	CreatedAt     time.Time              `json:"created_at"`
+	UpdatedAt     time.Time              `json:"updated_at"`
+	SearchText    string                 `json:"search_text"`
+}
+
+// ESSearchBackend integrates with Elasticsearch with transparent fallback to DB
+type ESSearchBackend struct {
+	client    *elasticsearch.Client
+	dbBackend SearchBackend // fallback
+	indexName string
+}
+
+// NewESSearchBackend creates an ESSearchBackend with real Elasticsearch integration
+func NewESSearchBackend(esBaseURL string, db *gorm.DB) (SearchBackend, error) {
+	cfg := elasticsearch.Config{
+		Addresses: []string{esBaseURL},
 	}
+	client, err := elasticsearch.NewClient(cfg)
+	if err != nil {
+		// Fall back to DB-only if ES unavailable
+		return &ESSearchBackend{
+			client:    nil,
+			dbBackend: NewDBSearchBackend(db),
+			indexName: "assets",
+		}, nil
+	}
+
+	// Verify ES connection
+	res, err := client.Info(context.Background())
+	if err != nil || res.IsError() {
+		// Fall back to DB if ES is down
+		return &ESSearchBackend{
+			client:    nil,
+			dbBackend: NewDBSearchBackend(db),
+			indexName: "assets",
+		}, nil
+	}
+
+	es := &ESSearchBackend{
+		client:    client,
+		dbBackend: NewDBSearchBackend(db),
+		indexName: "assets",
+	}
+
+	// Initialize Elasticsearch index with analyzers
+	if err := es.initializeIndex(context.Background()); err != nil {
+		// Log error but don't fail - will use DB backend
+	}
+
+	return es, nil
+}
+
+// initializeIndex creates the Elasticsearch index with custom analyzers
+func (es *ESSearchBackend) initializeIndex(ctx context.Context) error {
+	if es.client == nil {
+		return nil
+	}
+
+	// Check if index exists
+	res, _ := es.client.Indices.Exists([]string{es.indexName})
+	if res != nil && !res.IsError() {
+		return nil // Index already exists
+	}
+
+	indexMapping := map[string]interface{}{
+		"settings": map[string]interface{}{
+			"number_of_shards":   1,
+			"number_of_replicas": 0,
+			"analysis": map[string]interface{}{
+				"analyzer": map[string]interface{}{
+					"asset_analyzer": map[string]interface{}{
+						"type":      "custom",
+						"tokenizer": "standard",
+						"filter": []string{
+							"lowercase",
+							"stop",
+							"snowball",
+						},
+					},
+				},
+			},
+		},
+		"mappings": map[string]interface{}{
+			"properties": map[string]interface{}{
+				"id":             map[string]interface{}{"type": "keyword"},
+				"name":           map[string]interface{}{"type": "text", "analyzer": "asset_analyzer", "fields": map[string]interface{}{"keyword": map[string]interface{}{"type": "keyword"}}},
+				"symbol":         map[string]interface{}{"type": "keyword"},
+				"description":    map[string]interface{}{"type": "text", "analyzer": "asset_analyzer"},
+				"asset_type":     map[string]interface{}{"type": "keyword"},
+				"total_supply":   map[string]interface{}{"type": "long"},
+				"fractions":      map[string]interface{}{"type": "long"},
+				"contract_id":    map[string]interface{}{"type": "keyword"},
+				"owner_address":  map[string]interface{}{"type": "keyword"},
+				"metadata":       map[string]interface{}{"type": "object"},
+				"image_url":      map[string]interface{}{"type": "keyword"},
+				"document_url":   map[string]interface{}{"type": "keyword"},
+				"verified":       map[string]interface{}{"type": "boolean"},
+				"created_at":     map[string]interface{}{"type": "date"},
+				"updated_at":     map[string]interface{}{"type": "date"},
+				"search_text":    map[string]interface{}{"type": "text", "analyzer": "asset_analyzer"},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(indexMapping)
+	res, err := es.client.Indices.Create(es.indexName, es.client.Indices.Create.WithBody(strings.NewReader(string(body))))
+	if err != nil || res.IsError() {
+		return fmt.Errorf("failed to create ES index: %w", err)
+	}
+
+	return nil
 }
 
 func (es *ESSearchBackend) Search(ctx context.Context, req *SearchRequest) (*SearchResult, error) {
-	if es.baseURL == "" {
-		// ES not configured → fall back to DB search transparently.
-		return es.db.Search(ctx, req)
+	if es.client == nil {
+		return es.dbBackend.Search(ctx, req)
 	}
-	// TODO: call Elasticsearch _search endpoint here using es.baseURL.
-	// For now, delegate to the DB backend (mock behaviour).
-	return es.db.Search(ctx, req)
+
+	startTime := time.Now()
+
+	// Build ES query
+	query := es.buildESQuery(req)
+	body, _ := json.Marshal(query)
+
+	// Execute search
+	res, err := es.client.Search(
+		es.client.Search.WithContext(ctx),
+		es.client.Search.WithIndex(es.indexName),
+		es.client.Search.WithBody(strings.NewReader(string(body))),
+		es.client.Search.WithSize(req.Limit),
+		es.client.Search.WithFrom((req.Page - 1) * req.Limit),
+	)
+
+	if err != nil || res.IsError() {
+		// Fall back to DB search on error
+		return es.dbBackend.Search(ctx, req)
+	}
+
+	// Parse response
+	var esResp map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&esResp); err != nil {
+		return es.dbBackend.Search(ctx, req)
+	}
+
+	// Extract hits and total
+	hitsData := esResp["hits"].(map[string]interface{})
+	totalObj := hitsData["total"].(map[string]interface{})
+	total := int64(totalObj["value"].(float64))
+	hits := hitsData["hits"].([]interface{})
+
+	// Convert ES documents to Asset models
+	assets := make([]models.Asset, 0, len(hits))
+	for _, hit := range hits {
+		hitObj := hit.(map[string]interface{})
+		source := hitObj["_source"].(map[string]interface{})
+
+		// Parse metadata
+		var metadata string
+		if m, ok := source["metadata"].(map[string]interface{}); ok {
+			metadataJSON, _ := json.Marshal(m)
+			metadata = string(metadataJSON)
+		}
+
+		asset := models.Asset{
+			ID:           uint(source["id"].(float64)),
+			Name:         source["name"].(string),
+			Symbol:       source["symbol"].(string),
+			Description:  source["description"].(string),
+			AssetType:    source["asset_type"].(string),
+			TotalSupply:  int64(source["total_supply"].(float64)),
+			Fractions:    uint64(source["fractions"].(float64)),
+			ContractID:   source["contract_id"].(string),
+			OwnerAddress: source["owner_address"].(string),
+			Metadata:     metadata,
+			ImageURL:     source["image_url"].(string),
+			DocumentURL:  source["document_url"].(string),
+			Verified:     source["verified"].(bool),
+		}
+		assets = append(assets, asset)
+	}
+
+	facets := es.buildESFacets(ctx, req)
+	duration := time.Since(startTime).Seconds() * 1000
+
+	return &SearchResult{
+		Total:  total,
+		Page:   req.Page,
+		Limit:  req.Limit,
+		Assets: assets,
+		Facets: facets,
+		Took:   duration,
+	}, nil
 }
 
 func (es *ESSearchBackend) Suggest(ctx context.Context, query string, limit int) (*SuggestResult, error) {
-	if es.baseURL == "" {
-		return es.db.Suggest(ctx, query, limit)
+	if es.client == nil {
+		return es.dbBackend.Suggest(ctx, query, limit)
 	}
-	// TODO: call ES _suggest endpoint here.
-	return es.db.Suggest(ctx, query, limit)
+
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+
+	term := strings.TrimSpace(query)
+	if term == "" {
+		return &SuggestResult{Suggestions: []string{}}, nil
+	}
+
+	// Build completion suggester query
+	suggestQuery := map[string]interface{}{
+		"suggest": map[string]interface{}{
+			"asset-suggest": map[string]interface{}{
+				"prefix": term,
+				"completion": map[string]interface{}{
+					"field": "name.completion",
+					"size":  limit,
+					"skip_duplicates": true,
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(suggestQuery)
+	res, err := es.client.Search(
+		es.client.Search.WithContext(ctx),
+		es.client.Search.WithIndex(es.indexName),
+		es.client.Search.WithBody(strings.NewReader(string(body))),
+	)
+
+	if err != nil || res.IsError() {
+		// Fall back to DB
+		return es.dbBackend.Suggest(ctx, query, limit)
+	}
+
+	var esResp map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&esResp); err != nil {
+		return es.dbBackend.Suggest(ctx, query, limit)
+	}
+
+	suggestions := []string{}
+	if suggest, ok := esResp["suggest"].(map[string]interface{}); ok {
+		if assetSuggest, ok := suggest["asset-suggest"].([]interface{}); ok && len(assetSuggest) > 0 {
+			if suggestions_, ok := assetSuggest[0].(map[string]interface{})["options"].([]interface{}); ok {
+				for _, option := range suggestions_ {
+					if optionMap, ok := option.(map[string]interface{}); ok {
+						if text, ok := optionMap["text"].(string); ok {
+							suggestions = append(suggestions, text)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return &SuggestResult{Suggestions: suggestions}, nil
+}
+
+func (es *ESSearchBackend) IndexAsset(ctx context.Context, asset *models.Asset) error {
+	if es.client == nil {
+		return nil
+	}
+
+	// Parse metadata
+	var metadata map[string]string
+	if err := json.Unmarshal([]byte(asset.Metadata), &metadata); err != nil {
+		metadata = make(map[string]string)
+	}
+
+	searchText := fmt.Sprintf("%s %s %s", asset.Name, asset.Symbol, asset.Description)
+
+	doc := AssetDocument{
+		ID:           asset.ID,
+		Name:         asset.Name,
+		Symbol:       asset.Symbol,
+		Description:  asset.Description,
+		AssetType:    asset.AssetType,
+		TotalSupply:  asset.TotalSupply,
+		Fractions:    asset.Fractions,
+		ContractID:   asset.ContractID,
+		OwnerAddress: asset.OwnerAddress,
+		Metadata:     metadata,
+		ImageURL:     asset.ImageURL,
+		DocumentURL:  asset.DocumentURL,
+		Verified:     asset.Verified,
+		CreatedAt:    asset.CreatedAt,
+		UpdatedAt:    asset.UpdatedAt,
+		SearchText:   searchText,
+	}
+
+	body, _ := json.Marshal(doc)
+	docID := fmt.Sprintf("%d", asset.ID)
+
+	res, err := es.client.Index(
+		es.indexName,
+		es.client.Index.WithContext(ctx),
+		es.client.Index.WithDocumentID(docID),
+		es.client.Index.WithBody(strings.NewReader(string(body))),
+	)
+
+	if err != nil || res.IsError() {
+		return fmt.Errorf("failed to index asset: %w", err)
+	}
+
+	return nil
+}
+
+func (es *ESSearchBackend) DeleteAssetFromIndex(ctx context.Context, assetID uint) error {
+	if es.client == nil {
+		return nil
+	}
+
+	docID := fmt.Sprintf("%d", assetID)
+	res, err := es.client.Delete(
+		es.indexName,
+		docID,
+		es.client.Delete.WithContext(ctx),
+	)
+
+	if err != nil || res.IsError() {
+		return fmt.Errorf("failed to delete asset from index: %w", err)
+	}
+
+	return nil
+}
+
+func (es *ESSearchBackend) ReindexAll(ctx context.Context) error {
+	if es.client == nil {
+		return nil
+	}
+
+	// Delete existing index
+	es.client.Indices.Delete([]string{es.indexName})
+
+	// Recreate index
+	if err := es.initializeIndex(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (es *ESSearchBackend) RecordAnalytics(ctx context.Context, event *SearchAnalyticsEvent) error {
+	if es.client == nil {
+		return nil
+	}
+
+	analyticsIndex := "search_analytics"
+	body, _ := json.Marshal(event)
+
+	res, err := es.client.Index(
+		analyticsIndex,
+		es.client.Index.WithContext(ctx),
+		es.client.Index.WithBody(strings.NewReader(string(body))),
+	)
+
+	if err != nil || res.IsError() {
+		return fmt.Errorf("failed to record search analytics: %w", err)
+	}
+
+	return nil
+}
+
+func (es *ESSearchBackend) buildESQuery(req *SearchRequest) map[string]interface{} {
+	filters := []map[string]interface{}{}
+
+	// Full-text search on multiple fields with boosting
+	if term := strings.TrimSpace(req.Query); term != "" {
+		filters = append(filters, map[string]interface{}{
+			"multi_match": map[string]interface{}{
+				"query":  term,
+				"fields": []string{"name^3", "symbol^2", "description", "search_text"},
+				"fuzziness": "AUTO",
+			},
+		})
+	}
+
+	// Asset type filter
+	if req.AssetType != "" {
+		filters = append(filters, map[string]interface{}{
+			"term": map[string]interface{}{
+				"asset_type": req.AssetType,
+			},
+		})
+	}
+
+	// Verified status filter
+	if req.Verified != nil {
+		filters = append(filters, map[string]interface{}{
+			"term": map[string]interface{}{
+				"verified": *req.Verified,
+			},
+		})
+	}
+
+	// Price range filter (would require join with listings in production)
+	// Simplified for ES - in production, might denormalize current min/max price
+
+	sort := []map[string]interface{}{}
+	sortBy := req.SortBy
+	if sortBy == "" {
+		sortBy = "created_at"
+	}
+
+	switch sortBy {
+	case "name":
+		sort = append(sort, map[string]interface{}{"name.keyword": map[string]interface{}{"order": strings.ToLower(req.Order)}})
+	case "created_at":
+		sort = append(sort, map[string]interface{}{"created_at": map[string]interface{}{"order": strings.ToLower(req.Order)}})
+	case "total_supply":
+		sort = append(sort, map[string]interface{}{"total_supply": map[string]interface{}{"order": strings.ToLower(req.Order)}})
+	case "fractions":
+		sort = append(sort, map[string]interface{}{"fractions": map[string]interface{}{"order": strings.ToLower(req.Order)}})
+	default:
+		sort = append(sort, map[string]interface{}{"created_at": map[string]interface{}{"order": "desc"}})
+	}
+
+	query := map[string]interface{}{}
+
+	if len(filters) == 0 {
+		query["match_all"] = map[string]interface{}{}
+	} else if len(filters) == 1 {
+		query = filters[0]
+	} else {
+		query["bool"] = map[string]interface{}{
+			"must": filters,
+		}
+	}
+
+	return map[string]interface{}{
+		"query": query,
+		"sort":  sort,
+	}
+}
+
+func (es *ESSearchBackend) buildESFacets(ctx context.Context, req *SearchRequest) SearchFacets {
+	// Fall back to DB for facets to ensure accuracy
+	if dbBackend, ok := es.dbBackend.(*DBSearchBackend); ok {
+		return dbBackend.buildFacets(ctx, req)
+	}
+	return SearchFacets{}
 }

@@ -6,6 +6,7 @@ toolchain go1.24.13
 
 require (
 	github.com/alicebob/miniredis/v2 v2.31.1
+	github.com/elastic/go-elasticsearch/v8 v8.11.1
 	github.com/gin-gonic/gin v1.9.1
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
