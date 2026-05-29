@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/yourusername/kor-assetforge/apperrors"
 	"github.com/yourusername/kor-assetforge/models"
+	"github.com/yourusername/kor-assetforge/services"
 )
 
 // AuthConfig holds authentication configuration
@@ -29,13 +31,14 @@ type AuthConfig struct {
 
 // AuthHandler handles authentication operations
 type AuthHandler struct {
-	db     *gorm.DB
-	config *AuthConfig
+	db           *gorm.DB
+	config       *AuthConfig
+	emailService services.EmailService
 }
 
 // NewAuthHandler creates a new auth handler
-func NewAuthHandler(db *gorm.DB, config *AuthConfig) *AuthHandler {
-	return &AuthHandler{db: db, config: config}
+func NewAuthHandler(db *gorm.DB, config *AuthConfig, emailService services.EmailService) *AuthHandler {
+	return &AuthHandler{db: db, config: config, emailService: emailService}
 }
 
 // RegisterRequest represents user registration request
@@ -140,6 +143,12 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	if err := h.db.Create(&user).Error; err != nil {
 		apperrors.AbortWithError(c, apperrors.NewInternalError("Failed to create user"))
 		return
+	}
+
+	if h.emailService != nil {
+		if err := h.emailService.SendVerificationEmail(user.Email, user.Username, emailToken); err != nil {
+			log.Printf("failed to queue verification email: %v", err)
+		}
 	}
 
 	c.JSON(http.StatusCreated, gin.H{

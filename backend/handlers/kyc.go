@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -16,16 +17,17 @@ import (
 
 // KYCHandler handles all KYC / AML / compliance endpoints.
 type KYCHandler struct {
-	db       *gorm.DB
-	provider services.KYCProvider
+	db           *gorm.DB
+	provider     services.KYCProvider
+	emailService services.EmailService
 }
 
 // NewKYCHandler constructs a KYCHandler. Pass nil for provider to use the mock.
-func NewKYCHandler(db *gorm.DB, provider services.KYCProvider) *KYCHandler {
+func NewKYCHandler(db *gorm.DB, provider services.KYCProvider, emailService services.EmailService) *KYCHandler {
 	if provider == nil {
 		provider = services.NewMockKYCProvider()
 	}
-	return &KYCHandler{db: db, provider: provider}
+	return &KYCHandler{db: db, provider: provider, emailService: emailService}
 }
 
 // ---- request / response types -----------------------------------------------
@@ -194,6 +196,12 @@ func (h *KYCHandler) GetKYCStatus(c *gin.Context) {
 
 		h.writeAuditLog(userID, "status_changed", "KYCRecord", record.ID,
 			map[string]interface{}{"from": record.Status, "to": result.Status}, c.ClientIP())
+
+		if h.emailService != nil {
+			if err := h.notifyKYCStatusChange(userID, result.Status, result.ReviewNotes); err != nil {
+				log.Printf("failed to queue KYC status update email: %v", err)
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -453,10 +461,24 @@ func (h *KYCHandler) HandleKYCWebhook(c *gin.Context) {
 	h.writeAuditLog(record.UserID, "webhook_status_update", "KYCRecord", record.ID,
 		map[string]interface{}{"new_status": payload.Status}, c.ClientIP())
 
+	if h.emailService != nil {
+		if err := h.notifyKYCStatusChange(record.UserID, payload.Status, payload.ReviewNotes); err != nil {
+			log.Printf("failed to queue KYC webhook status email: %v", err)
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": "processed"})
 }
 
 // ---- internal helpers -------------------------------------------------------
+
+func (h *KYCHandler) notifyKYCStatusChange(userID uint, status, reviewNotes string) error {
+	var user models.User
+	if err := h.db.Select("email", "username").First(&user, userID).Error; err != nil {
+		return err
+	}
+	return h.emailService.SendKYCStatusUpdate(user.Email, user.Username, status, reviewNotes)
+}
 
 func (h *KYCHandler) writeAuditLog(userID uint, action, entityType string, entityID uint, details map[string]interface{}, ip string) {
 	raw, _ := json.Marshal(details)

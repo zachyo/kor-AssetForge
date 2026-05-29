@@ -101,7 +101,8 @@ func main() {
 		PasswordResetHours: getEnvIntOrDefault("PASSWORD_RESET_HOURS", 1),
 		BcryptCost:         getEnvIntOrDefault("BCRYPT_COST", 12),
 	}
-	authHandler := auth.NewAuthHandler(db, authConfig)
+	emailService := services.NewEmailServiceFromEnv()
+	authHandler := auth.NewAuthHandler(db, authConfig, emailService)
 	authMiddleware := auth.NewAuthMiddleware(authConfig.JWTSecret)
 	authRateLimiter := auth.NewAuthRateLimiter(rate.Limit(5.0/60.0), 10)
 
@@ -174,7 +175,7 @@ func main() {
 		}
 
 		// Asset routes (with write-through cache invalidation)
-		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient)
+		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient, emailService)
 		v1.POST("/assets/tokenize",
 			middleware.InvalidateOnWrite(cacheManager, "kor:asset:*"),
 			assetHandler.TokenizeAsset)
@@ -205,7 +206,7 @@ func main() {
 		v1.GET("/search/analytics", searchHandler.SearchAnalytics)
 
 		// KYC / AML routes (#55)
-		kycHandler := handlers.NewKYCHandler(db, nil) // nil = mock provider
+		kycHandler := handlers.NewKYCHandler(db, nil, emailService) // nil = mock provider
 		v1.POST("/kyc/submit", kycHandler.SubmitKYC)
 		v1.GET("/kyc/status", kycHandler.GetKYCStatus)
 		v1.POST("/kyc/documents", kycHandler.UploadDocument)
