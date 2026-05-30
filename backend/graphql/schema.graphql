@@ -1,0 +1,42 @@
+"""
+AssetForge GraphQL Schema
+Provides a flexible query interface alongside the REST API.
+"""
+
+type Query {
+  """Fetch a single asset by ID."""
+  asset(id: ID!): Asset
+
+  """List assets with optional filters."""
+  assets(limit: Int = 20, offset: Int = 0, status: String): [Asset!]!
+
+  """Fetch a user's public profile."""
+  userProfile(id: ID!): UserProfile
+
+  """Platform analytics summary."""
+  analyticsSummary: AnalyticsSummary
+}
+
+type Asset {
+  id: ID!
+  name: String!
+  symbol: String!
+  assetType: String!
+  status: String!
+  totalSupply: String!
+  createdAt: String!
+}
+
+type UserProfile {
+  id: ID!
+  username: String!
+  stellarAddress: String!
+  createdAt: String!
+}
+
+type AnalyticsSummary {
+  totalUsers: Int!
+  totalAssets: Int!
+  activeListings: Int!
+  reportGeneratedAt: String!
+}
