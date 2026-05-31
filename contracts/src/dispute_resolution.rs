@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
 
 // ============================================================================
 // Data Types
@@ -15,7 +15,7 @@ pub enum DisputeStatus {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[contracttype]
-pub enum DisputeResolution {
+pub enum DisputeOutcome {
     BuyerFavor,
     SellerFavor,
     Split,
@@ -30,7 +30,7 @@ pub struct Dispute {
     pub respondent: Address,
     pub reason: String,
     pub status: DisputeStatus,
-    pub resolution: Option<DisputeResolution>,
+    pub resolution: Option<DisputeOutcome>,
     pub escrow_amount: i128,
     pub escrow_released: bool,
     pub created_at: u64,
@@ -146,7 +146,7 @@ impl DisputeResolution {
         env: Env,
         admin: Address,
         dispute_id: u64,
-        resolution: DisputeResolution,
+        resolution: DisputeOutcome,
     ) -> Address {
         Self::require_admin(&env, &admin);
 
@@ -161,9 +161,9 @@ impl DisputeResolution {
         }
 
         let release_to = match resolution {
-            DisputeResolution::BuyerFavor => dispute.filed_by.clone(),
-            DisputeResolution::SellerFavor => dispute.respondent.clone(),
-            DisputeResolution::Split => dispute.filed_by.clone(), // split handled off-chain
+            DisputeOutcome::BuyerFavor => dispute.filed_by.clone(),
+            DisputeOutcome::SellerFavor => dispute.respondent.clone(),
+            DisputeOutcome::Split => dispute.filed_by.clone(), // split handled off-chain
         };
 
         dispute.status = DisputeStatus::Resolved;
@@ -284,7 +284,7 @@ mod test {
 
         client.start_review(&admin, &dispute_id);
 
-        let release_to = client.resolve_dispute(&admin, &dispute_id, &DisputeResolution::BuyerFavor);
+        let release_to = client.resolve_dispute(&admin, &dispute_id, &DisputeOutcome::BuyerFavor);
         assert_eq!(release_to, buyer);
 
         let dispute = client.get_dispute(&dispute_id).unwrap();
@@ -322,7 +322,7 @@ mod test {
         let reason = String::from_str(&env, "Double resolution test");
 
         let id = client.file_dispute(&buyer, &seller, &1, &reason, &200);
-        client.resolve_dispute(&admin, &id, &DisputeResolution::SellerFavor);
-        client.resolve_dispute(&admin, &id, &DisputeResolution::BuyerFavor);
+        client.resolve_dispute(&admin, &id, &DisputeOutcome::SellerFavor);
+        client.resolve_dispute(&admin, &id, &DisputeOutcome::BuyerFavor);
     }
 }

@@ -13,6 +13,7 @@ pub mod oracle;
 pub mod p2p_market;
 pub mod staking_rewards;
 pub mod upgradability;
+pub mod insurance;
 
 pub use asset_token::AssetToken;
 pub use auction::AuctionHouse;
@@ -26,3 +27,4 @@ pub use oracle::Oracle;
 pub use p2p_market::P2PMarket;
 pub use staking_rewards::StakingRewards;
 pub use upgradability::Upgradability;
+pub use insurance::AssetInsurance;

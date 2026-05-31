@@ -336,7 +336,7 @@ impl Marketplace {
     pub fn purchase(
         env: Env,
         buyer: Address,
-        listing_id: u64,
+        _listing_id: u64,
         amount: i128,
         asset_id: u64,
         emergency_control_id: Address,

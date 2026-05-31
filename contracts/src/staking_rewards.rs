@@ -371,7 +371,7 @@ impl StakingRewards {
     }
 
     /// Get stake position for a staker.
-    pub fn get_position(env: Env, staker: Address, asset_id: u64) -> Option<StakePosition> {
+    pub fn get_stake_position(env: Env, staker: Address, asset_id: u64) -> Option<StakePosition> {
         env.storage()
             .persistent()
             .get(&StakingDataKey::Position(asset_id, staker))
@@ -515,7 +515,7 @@ mod test {
 
         assert_eq!(total_after, total_before - 500_000);
 
-        let pos = client.get_position(&staker, &asset_id).unwrap();
+        let pos = client.get_stake_position(&staker, &asset_id).unwrap();
         assert_eq!(pos.amount, 500_000);
         assert!(pos.active);
     }

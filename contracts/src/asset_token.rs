@@ -326,6 +326,9 @@ pub enum DataKey {
     VerificationStatus(u64), // asset_id -> status
     VerificationHistory(Address), // verifier -> Vec<asset_id>
     LastVerifierIndex,
+    // Concentration limits
+    ConcentrationLimit,
+    ExemptFromLimit(Address),
 }
 
 #[derive(Clone)]
@@ -445,10 +448,23 @@ impl AssetToken {
 
         let mut balance = Self::balance(env.clone(), to.clone());
         balance = balance.checked_add(amount).unwrap();
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &balance);
-
+        
         let supply = Self::total_supply(env.clone());
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply.checked_add(amount).unwrap()));
+        let new_supply = supply.checked_add(amount).unwrap();
+
+        // Check ownership concentration limit
+        if let Some(limit_bps) = env.storage().instance().get::<_, u32>(&DataKey::ConcentrationLimit) {
+            let is_exempt: bool = env.storage().persistent().get(&DataKey::ExemptFromLimit(to.clone())).unwrap_or(false);
+            if !is_exempt {
+                let max_allowed = (new_supply * limit_bps as i128) / 10000;
+                if balance > max_allowed {
+                    panic!("Ownership concentration limit exceeded");
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &balance);
+        env.storage().instance().set(&DataKey::TotalSupply, &new_supply);
 
         // Record transaction
         Self::record_transaction(&env, TransactionType::Mint, asset.owner.clone(), Some(to.clone()), amount, asset_id, 0);
@@ -482,6 +498,18 @@ impl AssetToken {
 
         from_balance = from_balance.checked_sub(amount).unwrap();
         to_balance = to_balance.checked_add(amount).unwrap();
+
+        // Check ownership concentration limit
+        if let Some(limit_bps) = env.storage().instance().get::<_, u32>(&DataKey::ConcentrationLimit) {
+            let is_exempt: bool = env.storage().persistent().get(&DataKey::ExemptFromLimit(to.clone())).unwrap_or(false);
+            if !is_exempt {
+                let supply = Self::total_supply(env.clone());
+                let max_allowed = (supply * limit_bps as i128) / 10000;
+                if to_balance > max_allowed {
+                    panic!("Ownership concentration limit exceeded");
+                }
+            }
+        }
 
         env.storage().persistent().set(&DataKey::Balance(from.clone()), &from_balance);
         env.storage().persistent().set(&DataKey::Balance(to.clone()), &to_balance);
@@ -560,7 +588,7 @@ impl AssetToken {
 
         let mut user_batches: Vec<u64> = env.storage().instance().get(&DataKey::UserBatchTransactions(from.clone())).unwrap_or(Vec::new(&env));
         user_batches.push_back(batch_id);
-        env.storage().instance().set(&DataKey::UserBatchTransactions(from), &user_batches);
+        env.storage().instance().set(&DataKey::UserBatchTransactions(from.clone()), &user_batches);
 
         env.events().publish((Symbol::new(&env, "batch_completed"), from), batch_id);
 
@@ -579,6 +607,31 @@ impl AssetToken {
 
     pub fn total_supply(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0)
+    }
+
+    pub fn set_concentration_limit(env: Env, admin: Address, limit_bps: u32) {
+        admin.require_auth();
+        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, expected_admin, "not admin");
+        assert!(limit_bps <= 10000, "limit must be <= 10000");
+        env.storage().instance().set(&DataKey::ConcentrationLimit, &limit_bps);
+        env.events().publish((Symbol::new(&env, "concentration_limit_set"), admin), limit_bps);
+    }
+
+    pub fn set_exemption(env: Env, admin: Address, account: Address, is_exempt: bool) {
+        admin.require_auth();
+        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, expected_admin, "not admin");
+        env.storage().persistent().set(&DataKey::ExemptFromLimit(account.clone()), &is_exempt);
+        env.events().publish((Symbol::new(&env, "exemption_set"), admin), (account, is_exempt));
+    }
+
+    pub fn get_concentration_limit(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::ConcentrationLimit)
+    }
+
+    pub fn is_exempt(env: Env, account: Address) -> bool {
+        env.storage().persistent().get(&DataKey::ExemptFromLimit(account)).unwrap_or(false)
     }
 
     pub fn name(env: Env) -> String {
@@ -814,7 +867,7 @@ impl AssetToken {
     }
 
     /// Get distribution information
-    pub fn get_distribution(env: Env, distribution_id: u64) -> Option<DividendDistribution> {
+    pub fn get_dividend_distribution(env: Env, distribution_id: u64) -> Option<DividendDistribution> {
         env.storage().instance().get(&DataKey::DividendDistribution(distribution_id))
     }
 
@@ -1929,7 +1982,7 @@ mod test {
         
         assert_eq!(distribution_id, 1);
         
-        let distribution = client.get_distribution(&distribution_id).unwrap();
+        let distribution = client.get_dividend_distribution(&distribution_id).unwrap();
         assert_eq!(distribution.asset_id, 1);
         assert_eq!(distribution.total_amount, 100000);
         assert_eq!(distribution.tax_withholding_rate, 500);
@@ -2001,17 +2054,17 @@ mod test {
         let payout_asset = Address::generate(&env);
         let distribution_id = client.create_dividend_distribution(&admin, &1, &100000, &payout_asset, &500, &Some(snapshot_id));
         
-        let distribution = client.get_distribution(&distribution_id).unwrap();
+        let distribution = client.get_dividend_distribution(&distribution_id).unwrap();
         assert!(!distribution.is_paused);
         
         client.pause_distribution(&admin, &distribution_id);
         
-        let distribution = client.get_distribution(&distribution_id).unwrap();
+        let distribution = client.get_dividend_distribution(&distribution_id).unwrap();
         assert!(distribution.is_paused);
         
         client.resume_distribution(&admin, &distribution_id);
         
-        let distribution = client.get_distribution(&distribution_id).unwrap();
+        let distribution = client.get_dividend_distribution(&distribution_id).unwrap();
         assert!(!distribution.is_paused);
     }
 

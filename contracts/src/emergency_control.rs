@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec, Map, Vec as SorobanVec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 /// Defines the scope of a pause operation.
 /// Supports granular, per-function pauses or a global halt.
@@ -19,73 +19,6 @@ pub enum PauseScope {
     User(Address),
     /// Pause specific asset
     Asset(u64),
-}
-
-/// Pause condition types for automated unpausing
-#[derive(Clone, PartialEq, Debug)]
-#[contracttype]
-pub enum PauseCondition {
-    /// Unpause at specific ledger sequence
-    LedgerSequence(u32),
-    /// Unpause at specific timestamp
-    Timestamp(u64),
-    /// Unpause when price condition met
-    PriceCondition { asset_id: u64, threshold: i128, above: bool },
-    /// Unpause when governance vote passes
-    GovernanceVote { proposal_id: u64, required_votes: u32 },
-    /// Unpause when multiple admins approve
-    MultiAdminApproval { required_approvals: u32 },
-}
-
-/// Enhanced pause record with additional metadata
-#[derive(Clone)]
-#[contracttype]
-pub struct PauseRecord {
-    pub asset_id: u64,
-    pub admin: Address,
-    pub scope: PauseScope,
-    pub reason: String,
-    pub ledger_timestamp: u32,
-    pub is_pause: bool,
-    pub condition: Option<PauseCondition>,
-    pub auto_unpause: bool,
-    pub notifications_sent: u32,
-}
-
-/// Multi-admin approval tracking
-#[derive(Clone)]
-#[contracttype]
-pub struct AdminApproval {
-    pub admin: Address,
-    pub approved_at: u32,
-    pub reason: String,
-}
-
-/// Pause analytics data
-#[derive(Clone)]
-#[contracttype]
-pub struct PauseAnalytics {
-    pub total_pauses: u32,
-    pub total_unpauses: u32,
-    pub avg_pause_duration: u32,
-    pub most_paused_scope: PauseScope,
-    pub last_pause_timestamp: u32,
-}
-
-/// Governance proposal for pause operations
-#[derive(Clone)]
-#[contracttype]
-pub struct PauseProposal {
-    pub proposal_id: u64,
-    pub proposer: Address,
-    pub scope: PauseScope,
-    pub asset_id: u64,
-    pub reason: String,
-    pub votes_for: u32,
-    pub votes_against: u32,
-    pub created_at: u32,
-    pub expires_at: u32,
-    pub executed: bool,
 }
 
 /// A record of a pause or unpause event for audit trail purposes.
@@ -124,6 +57,9 @@ fn pause_flag_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
         PauseScope::Transfers => 1,
         PauseScope::Trading => 2,
         PauseScope::Minting => 3,
+        PauseScope::Function(_) => 4,
+        PauseScope::User(_) => 5,
+        PauseScope::Asset(_) => 6,
     };
     let mut key_str = [0u8; 32];
     let prefix = b"p_";
@@ -163,6 +99,9 @@ fn auto_unpause_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
         PauseScope::Transfers => 1,
         PauseScope::Trading => 2,
         PauseScope::Minting => 3,
+        PauseScope::Function(_) => 4,
+        PauseScope::User(_) => 5,
+        PauseScope::Asset(_) => 6,
     };
     let mut key_str = [0u8; 32];
     let prefix = b"au_";
