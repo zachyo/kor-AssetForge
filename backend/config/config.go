@@ -122,6 +122,16 @@ func InitDB() (*gorm.DB, error) {
 		&models.ApprovalRequest{},
 		&models.ApprovalAction{},
 		&models.AuditLog{},
+		// Taxonomy models (#159)
+		&models.Category{},
+		&models.AssetCategory{},
+		&models.Tag{},
+		&models.AssetTag{},
+		// Watchlist models (#160)
+		&models.Watchlist{},
+		&models.WatchlistItem{},
+		// User activity model (#161)
+		&models.UserActivity{},
 	); err != nil {
 		return nil, fmt.Errorf("failed to auto-migrate models: %w", err)
 	}
