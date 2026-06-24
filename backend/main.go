@@ -382,6 +382,48 @@ func main() {
 			legalProtected.POST("/gdpr/export", legalHandler.RequestDataExport)
 			legalProtected.GET("/gdpr/export/:id", legalHandler.GetDataExportStatus)
 		}
+
+		// Asset taxonomy routes (#159)
+		taxonomyHandler := handlers.NewTaxonomyHandler(db)
+		v1.GET("/taxonomy/categories", taxonomyHandler.ListCategories)
+		v1.GET("/taxonomy/tags", taxonomyHandler.ListTags)
+		v1.GET("/taxonomy/tags/autocomplete", taxonomyHandler.TagAutocomplete)
+		v1.GET("/assets/:id/taxonomy", taxonomyHandler.GetAssetTaxonomy)
+		taxonomyAdmin := adminGroup.Group("/taxonomy")
+		{
+			taxonomyAdmin.POST("/categories", taxonomyHandler.CreateCategory)
+			taxonomyAdmin.PUT("/categories/:id", taxonomyHandler.UpdateCategory)
+			taxonomyAdmin.DELETE("/categories/:id", taxonomyHandler.DeleteCategory)
+			taxonomyAdmin.POST("/tags", taxonomyHandler.CreateTag)
+			taxonomyAdmin.DELETE("/tags/:id", taxonomyHandler.DeleteTag)
+		}
+		protected.PUT("/assets/:id/categories", taxonomyHandler.SetAssetCategories)
+		protected.PUT("/assets/:id/tags", taxonomyHandler.SetAssetTags)
+
+		// Watchlist routes (#160)
+		watchlistHandler := handlers.NewWatchlistHandler(db)
+		v1.GET("/watchlists/public", watchlistHandler.ListPublicWatchlists)
+		watchlistGroup := protected.Group("/watchlists")
+		{
+			watchlistGroup.GET("", watchlistHandler.ListWatchlists)
+			watchlistGroup.POST("", watchlistHandler.CreateWatchlist)
+			watchlistGroup.GET("/:id", watchlistHandler.GetWatchlist)
+			watchlistGroup.PATCH("/:id", watchlistHandler.UpdateWatchlist)
+			watchlistGroup.DELETE("/:id", watchlistHandler.DeleteWatchlist)
+			watchlistGroup.POST("/:id/assets", watchlistHandler.AddAsset)
+			watchlistGroup.DELETE("/:id/assets/:assetId", watchlistHandler.RemoveAsset)
+		}
+
+		// User activity dashboard routes (#161)
+		analyticsService := services.NewAnalyticsService(db, redisClient)
+		dashboardHandler := handlers.NewUserDashboardHandler(db, analyticsService)
+		dashboardGroup := protected.Group("/dashboard")
+		{
+			dashboardGroup.GET("", dashboardHandler.GetDashboard)
+			dashboardGroup.GET("/activity", dashboardHandler.GetActivityTimeline)
+			dashboardGroup.GET("/export", dashboardHandler.ExportReport)
+			dashboardGroup.POST("/activity", dashboardHandler.RecordActivity)
+		}
 	}
 
 	// API v2 routes (#124)
