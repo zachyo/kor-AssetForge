@@ -70,6 +70,31 @@ func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 		return
 	}
 
+	fractionHandler := NewFractionHandler(h.db)
+	assetConfig, _ := fractionHandler.GetApplicableConfig(req.AssetType)
+	if assetConfig != nil {
+		if req.Fractions > 0 {
+			fractionSize := float64(req.TotalSupply) / float64(req.Fractions)
+			if fractionSize < assetConfig.MinFractionSize {
+				apperrors.AbortWithError(c, apperrors.NewBadRequestError(
+					"Fraction size too small: minimum is "+fmt.Sprintf("%f", assetConfig.MinFractionSize)))
+				return
+			}
+			if fractionSize > assetConfig.MaxFractionSize {
+				apperrors.AbortWithError(c, apperrors.NewBadRequestError(
+					"Fraction size too large: maximum is "+fmt.Sprintf("%f", assetConfig.MaxFractionSize)))
+				return
+			}
+		}
+		if assetConfig.RequireAccreditation {
+			var user models.User
+			if err := h.db.First(&user, c.GetUint("user_id")).Error; err != nil || !user.AccreditedInvestor {
+				apperrors.AbortWithError(c, apperrors.NewForbiddenError("Accredited investor status required for this asset type"))
+				return
+			}
+		}
+	}
+
 	metadataJSON, _ := json.Marshal(req.Metadata)
 
 	asset := models.Asset{

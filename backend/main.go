@@ -368,6 +368,16 @@ func main() {
 			webhookSubs.GET("/:id/logs", outgoingWebhookHandler.GetDeliveryLogs)
 		}
 
+		// Webhook retry and DLQ routes (#186)
+		webhookDeliveryGroup := protected.Group("/webhooks/delivery")
+		{
+			webhookDeliveryGroup.POST("/:id/retry", outgoingWebhookHandler.RetryDelivery)
+			webhookDeliveryGroup.POST("/retry-all", outgoingWebhookHandler.RetryAllFailedDeliveries)
+			webhookDeliveryGroup.POST("/replay-dlq", outgoingWebhookHandler.ReplayDLQ)
+			webhookDeliveryGroup.GET("/dashboard", outgoingWebhookHandler.GetDeliveryDashboard)
+			webhookDeliveryGroup.GET("/:id", outgoingWebhookHandler.GetDeliveryLog)
+		}
+
 		// Notification routes (#123)
 		notificationHandler := handlers.NewNotificationHandler(db)
 		notifGroup := protected.Group("/notifications")
