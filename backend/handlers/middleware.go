@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"runtime/debug"
@@ -9,7 +10,38 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/yourusername/kor-assetforge/apperrors"
+	"github.com/yourusername/kor-assetforge/i18n"
+	"github.com/yourusername/kor-assetforge/middleware"
 )
+
+// errorCodeTranslationKeys maps apperrors error codes to i18n keys so error
+// responses can be localized for the requester's resolved language (#185).
+var errorCodeTranslationKeys = map[apperrors.ErrorCode]string{
+	apperrors.CodeValidationFailed:     "errors.validation_failed",
+	apperrors.CodeNotFound:             "errors.not_found",
+	apperrors.CodeUnauthorized:         "errors.unauthorized",
+	apperrors.CodeForbidden:            "errors.forbidden",
+	apperrors.CodeConflict:             "errors.conflict",
+	apperrors.CodeTooManyRequests:      "errors.too_many_requests",
+	apperrors.CodeInternalServerError:  "errors.internal_server_error",
+}
+
+// localizedErrorMessage returns the translated message for err's AppError code
+// in the request's resolved language, falling back to err's own message text
+// for error codes that don't have a translation entry.
+func localizedErrorMessage(c *gin.Context, err error) string {
+	var appErr *apperrors.AppError
+	if errors.As(err, &appErr) {
+		if key, ok := errorCodeTranslationKeys[appErr.Code]; ok {
+			lang := middleware.LanguageFromContext(c)
+			return i18n.T(lang, key, nil)
+		}
+		return appErr.Message
+	}
+	return err.Error()
+}
 
 var Logger *zap.Logger
 
@@ -78,11 +110,11 @@ func GlobalErrorHandler() gin.HandlerFunc {
 		if len(c.Errors) > 0 {
 			requestID, _ := c.Get("request_id")
 			err := c.Errors.Last()
-			
-			// Standardized JSON error response
+
+			// Standardized JSON error response, localized per the resolved request language (#185)
 			c.JSON(c.Writer.Status(), gin.H{
 				"error":      "Processing Error",
-				"message":    err.Error(),
+				"message":    localizedErrorMessage(c, err.Err),
 				"request_id": requestID,
 				"code":       c.Writer.Status(),
 			})
