@@ -137,6 +137,7 @@ func main() {
 		middleware.VersionNegotiation(),
 		middleware.TracingMiddleware("kor-assetforge-api"),
 		handlers.RequestLogger(),
+		middleware.DetectLanguage(), // resolve request language for i18n (#185)
 		handlers.GlobalErrorHandler(),
 		middleware.RequestSizeLimiter(2<<20),
 		middleware.RequireJSON(),
@@ -184,6 +185,15 @@ func main() {
 			authGroup.POST("/reset-password", authHandler.ResetPassword)
 		}
 
+		// OAuth social login routes (#183)
+		oauthService := services.NewOAuthService()
+		oauthHandler := auth.NewOAuthHandler(db, authConfig, oauthService)
+		oauthGroup := v1.Group("/auth/oauth")
+		{
+			oauthGroup.GET("/:provider/url", oauthHandler.GetAuthURL)
+			oauthGroup.POST("/:provider/callback", oauthHandler.Callback)
+		}
+
 		// Protected user routes
 		protected := v1.Group("")
 		protected.Use(authMiddleware.JWTAuth())
@@ -198,6 +208,15 @@ func main() {
 			protected.POST("/auth/2fa/verify", authHandler.Verify2FA)
 			protected.POST("/auth/2fa/disable", authHandler.Disable2FA)
 
+			// 2FA recovery code routes (#182)
+			protected.POST("/auth/2fa/recovery-codes", authHandler.GenerateRecoveryCodes)
+			protected.GET("/auth/2fa/recovery-codes", authHandler.GetRecoveryCodesStatus)
+
+			// OAuth account linking routes (#183)
+			protected.GET("/auth/oauth/linked", oauthHandler.ListLinkedAccounts)
+			protected.POST("/auth/oauth/:provider/link", oauthHandler.LinkAccount)
+			protected.DELETE("/auth/oauth/:provider/unlink", oauthHandler.UnlinkAccount)
+
 			// Admin-only routes
 			{
 				// Dispute admin endpoints — handlers declared below, referenced via closures
@@ -211,11 +230,24 @@ func main() {
 				adminGroup.POST("/staking/distribute", func(c *gin.Context) {
 					handlers.NewStakingHandler(db).DistributeRewards(c)
 				})
+
+				// Fee distribution admin endpoints (#181)
+				feeDistributionHandler := handlers.NewFeeDistributionAdminHandler(db)
+				feeDistributionAdmin := adminGroup.Group("/fee-distribution")
+				{
+					feeDistributionAdmin.POST("/rules", feeDistributionHandler.CreateRule)
+					feeDistributionAdmin.GET("/rules", feeDistributionHandler.ListRules)
+					feeDistributionAdmin.POST("/rules/:id/activate", feeDistributionHandler.ActivateRule)
+					feeDistributionAdmin.POST("/runs", feeDistributionHandler.RunDistribution)
+					feeDistributionAdmin.GET("/runs", feeDistributionHandler.ListRuns)
+					feeDistributionAdmin.GET("/runs/:id", feeDistributionHandler.GetRun)
+				}
 			}
 		}
 
 		// 2FA verification during login (unauthenticated)
 		v1.POST("/auth/2fa/login", authHandler.LoginWith2FA)
+		v1.POST("/auth/2fa/recovery-codes/login", authHandler.LoginWithRecoveryCode)
 
 		// Asset routes (with write-through cache invalidation)
 		workflowService := services.NewWorkflowService(db, emailService)
