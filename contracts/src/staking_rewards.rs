@@ -4,6 +4,23 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Ve
 // Data Types
 // ============================================================================
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum StrategyType {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct StrategyPerformance {
+    pub total_staked: i128,
+    pub total_rewards_distributed: i128,
+    pub staker_count: u32,
+    pub last_updated: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct StakePosition {
@@ -14,6 +31,7 @@ pub struct StakePosition {
     pub staked_at: u64,
     pub last_reward_at: u64,
     pub active: bool,
+    pub strategy: StrategyType,
 }
 
 #[derive(Clone)]
@@ -25,6 +43,8 @@ pub struct RewardConfig {
     pub min_duration: u64,
     /// Whether new stakes are allowed
     pub paused: bool,
+    /// Whether auto-compounding is enabled for this asset
+    pub auto_compound: bool,
 }
 
 #[derive(Clone)]
@@ -63,13 +83,12 @@ pub enum StakingDataKey {
     Admin,
     RewardConfig(u64),
     StakeNonce,
-    Position(u64, Address),    // (asset_id, staker)
-    AssetStakers(u64),         // Vec<Address>
+    Position(u64, Address),          // (asset_id, staker)
+    AssetStakers(u64),               // Vec<Address>
     DistNonce,
     Distribution(u64),
     TotalStaked(u64),
-    PoolCapacity(u64),         // (asset_id) -> PoolCapacity
-    Waitlist(u64),             // (asset_id) -> Vec<WaitlistEntry> (FIFO)
+    StrategyPerf(u64, StrategyType), // (asset_id, strategy)
 }
 
 // ============================================================================
@@ -99,6 +118,7 @@ impl StakingRewards {
             apr_bps,
             min_duration,
             paused: false,
+            auto_compound: false,
         };
         env.storage()
             .persistent()
@@ -182,6 +202,7 @@ impl StakingRewards {
                 staked_at: now,
                 last_reward_at: now,
                 active: true,
+                strategy: StrategyType::Balanced,
             });
 
         // Accrue pending rewards before changing principal
@@ -460,78 +481,18 @@ impl StakingRewards {
         (count, total_distributed)
     }
 
-    // -----------------------------------------------------------------------
-    // Pool capacity and waitlist (Issue #208)
-    // -----------------------------------------------------------------------
-
-    /// Set the maximum staking capacity for a pool. 0 = unlimited.
-    pub fn set_pool_capacity(env: Env, admin: Address, asset_id: u64, max_capacity: i128) {
-        Self::require_admin(&env, &admin);
-        if max_capacity < 0 {
-            panic!("max_capacity must be non-negative");
-        }
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&StakingDataKey::TotalStaked(asset_id))
-            .unwrap_or(0);
-        let is_full = max_capacity > 0 && total >= max_capacity;
-        let cap = PoolCapacity { max_capacity, is_full };
-        env.storage()
-            .persistent()
-            .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
-        env.events().publish(
-            (Symbol::new(&env, "capacity_set"), asset_id),
-            (max_capacity, is_full),
-        );
-    }
-
-    /// Join the FIFO waitlist for a full pool.
-    ///
-    /// The entry is stored and will be activated automatically when space
-    /// becomes available via `rebalance_pool`.
-    pub fn join_waitlist(env: Env, staker: Address, asset_id: u64, amount: i128) {
+    /// Stake tokens under a specific yield strategy.
+    pub fn stake_with_strategy(
+        env: Env,
+        staker: Address,
+        asset_id: u64,
+        amount: i128,
+        strategy: StrategyType,
+    ) {
         staker.require_auth();
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        let cap: PoolCapacity = env
-            .storage()
-            .persistent()
-            .get(&StakingDataKey::PoolCapacity(asset_id))
-            .expect("capacity not configured for asset");
-        if !cap.is_full {
-            panic!("pool is not full; stake directly");
-        }
-        let now = env.ledger().timestamp();
-        let entry = WaitlistEntry { staker: staker.clone(), asset_id, amount, queued_at: now };
-        let mut waitlist: Vec<WaitlistEntry> = env
-            .storage()
-            .persistent()
-            .get(&StakingDataKey::Waitlist(asset_id))
-            .unwrap_or(Vec::new(&env));
-        waitlist.push_back(entry);
-        env.storage()
-            .persistent()
-            .set(&StakingDataKey::Waitlist(asset_id), &waitlist);
-        env.events().publish(
-            (Symbol::new(&env, "waitlist_joined"), staker),
-            (asset_id, amount),
-        );
-    }
 
-    /// Rebalance the pool: admit queued waitlist entries (FIFO) up to capacity.
-    ///
-    /// Admin-triggered. Emits `pool_rebalanced` with how many entries were promoted.
-    pub fn rebalance_pool(env: Env, admin: Address, asset_id: u64) -> u32 {
-        Self::require_admin(&env, &admin);
-        let mut cap: PoolCapacity = env
-            .storage()
-            .persistent()
-            .get(&StakingDataKey::PoolCapacity(asset_id))
-            .expect("capacity not configured");
-        if cap.max_capacity == 0 {
-            return 0; // unlimited – nothing to rebalance
+        if amount <= 0 {
+            panic!("stake amount must be positive");
         }
 
         let config: RewardConfig = env
@@ -540,110 +501,192 @@ impl StakingRewards {
             .get(&StakingDataKey::RewardConfig(asset_id))
             .expect("rewards not configured for asset");
 
-        let mut waitlist: Vec<WaitlistEntry> = env
+        if config.paused {
+            panic!("staking is paused for this asset");
+        }
+
+        let now = env.ledger().timestamp();
+
+        let mut position: StakePosition = env
             .storage()
             .persistent()
-            .get(&StakingDataKey::Waitlist(asset_id))
-            .unwrap_or(Vec::new(&env));
+            .get(&StakingDataKey::Position(asset_id, staker.clone()))
+            .unwrap_or(StakePosition {
+                staker: staker.clone(),
+                asset_id,
+                amount: 0,
+                accrued_rewards: 0,
+                staked_at: now,
+                last_reward_at: now,
+                active: true,
+                strategy: strategy.clone(),
+            });
 
-        let mut promoted: u32 = 0;
-        let mut remaining = Vec::new(&env);
-
-        for entry in waitlist.iter() {
-            let total: i128 = env
-                .storage()
-                .instance()
-                .get(&StakingDataKey::TotalStaked(asset_id))
-                .unwrap_or(0);
-            let available = cap.max_capacity - total;
-            if available <= 0 {
-                remaining.push_back(entry.clone());
-                continue;
-            }
-            let stake_amount = entry.amount.min(available);
-            let now = env.ledger().timestamp();
-            let mut position: StakePosition = env
-                .storage()
-                .persistent()
-                .get(&StakingDataKey::Position(asset_id, entry.staker.clone()))
-                .unwrap_or(StakePosition {
-                    staker: entry.staker.clone(),
-                    asset_id,
-                    amount: 0,
-                    accrued_rewards: 0,
-                    staked_at: now,
-                    last_reward_at: now,
-                    active: true,
-                });
-            if position.amount > 0 {
-                let pending = Self::calculate_pending_reward(&env, &position, &config, now);
-                position.accrued_rewards =
-                    position.accrued_rewards.checked_add(pending).expect("overflow");
-            }
-            position.amount = position.amount.checked_add(stake_amount).expect("overflow");
-            position.last_reward_at = now;
-            position.active = true;
-            env.storage()
-                .persistent()
-                .set(&StakingDataKey::Position(asset_id, entry.staker.clone()), &position);
-            let mut stakers: Vec<Address> = env
-                .storage()
-                .instance()
-                .get(&StakingDataKey::AssetStakers(asset_id))
-                .unwrap_or(Vec::new(&env));
-            let mut tracked = false;
-            for s in stakers.iter() {
-                if s == entry.staker { tracked = true; break; }
-            }
-            if !tracked {
-                stakers.push_back(entry.staker.clone());
-                env.storage().instance().set(&StakingDataKey::AssetStakers(asset_id), &stakers);
-            }
-            let new_total = total + stake_amount;
-            env.storage().instance().set(&StakingDataKey::TotalStaked(asset_id), &new_total);
-            env.events().publish(
-                (Symbol::new(&env, "waitlist_promoted"), entry.staker.clone()),
-                (asset_id, stake_amount),
-            );
-            promoted += 1;
-            // If only partial amount admitted, requeing the remainder would add complexity;
-            // emit partial entry event but drop the remainder for simplicity.
+        if position.amount > 0 {
+            let pending = Self::calculate_pending_reward(&env, &position, &config, now);
+            position.accrued_rewards = position
+                .accrued_rewards
+                .checked_add(pending)
+                .expect("reward overflow");
         }
+
+        position.amount = position.amount.checked_add(amount).expect("stake overflow");
+        position.last_reward_at = now;
+        position.active = true;
+        position.strategy = strategy.clone();
 
         env.storage()
             .persistent()
-            .set(&StakingDataKey::Waitlist(asset_id), &remaining);
+            .set(&StakingDataKey::Position(asset_id, staker.clone()), &position);
 
-        let total_now: i128 = env
+        let mut stakers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StakingDataKey::AssetStakers(asset_id))
+            .unwrap_or(Vec::new(&env));
+        let mut already_tracked = false;
+        for s in stakers.iter() {
+            if s == staker {
+                already_tracked = true;
+                break;
+            }
+        }
+        if !already_tracked {
+            stakers.push_back(staker.clone());
+            env.storage()
+                .instance()
+                .set(&StakingDataKey::AssetStakers(asset_id), &stakers);
+        }
+
+        let total: i128 = env
             .storage()
             .instance()
             .get(&StakingDataKey::TotalStaked(asset_id))
             .unwrap_or(0);
-        cap.is_full = total_now >= cap.max_capacity;
         env.storage()
+            .instance()
+            .set(&StakingDataKey::TotalStaked(asset_id), &(total + amount));
+
+        // Update strategy performance
+        let perf_key = StakingDataKey::StrategyPerf(asset_id, strategy.clone());
+        let mut perf: StrategyPerformance = env
+            .storage()
             .persistent()
-            .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
+            .get(&perf_key)
+            .unwrap_or(StrategyPerformance {
+                total_staked: 0,
+                total_rewards_distributed: 0,
+                staker_count: 0,
+                last_updated: now,
+            });
+        perf.total_staked = perf.total_staked.checked_add(amount).unwrap_or(perf.total_staked);
+        if !already_tracked {
+            perf.staker_count += 1;
+        }
+        perf.last_updated = now;
+        env.storage().persistent().set(&perf_key, &perf);
 
         env.events().publish(
-            (Symbol::new(&env, "pool_rebalanced"), asset_id),
-            promoted,
+            (Symbol::new(&env, "tokens_staked"), staker),
+            (asset_id, amount),
         );
-        promoted
     }
 
-    /// Get capacity config for a pool.
-    pub fn get_pool_capacity(env: Env, asset_id: u64) -> Option<PoolCapacity> {
+    /// Compound accrued rewards back into the staked principal.
+    pub fn compound_rewards(env: Env, staker: Address, asset_id: u64) {
+        staker.require_auth();
+
+        let config: RewardConfig = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::RewardConfig(asset_id))
+            .expect("rewards not configured for asset");
+
+        let now = env.ledger().timestamp();
+
+        let mut position: StakePosition = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::Position(asset_id, staker.clone()))
+            .expect("no stake position found");
+
+        let pending = Self::calculate_pending_reward(&env, &position, &config, now);
+        position.accrued_rewards = position
+            .accrued_rewards
+            .checked_add(pending)
+            .expect("reward overflow");
+        position.last_reward_at = now;
+
+        if position.accrued_rewards <= 0 {
+            panic!("no rewards to compound");
+        }
+
+        let compounded = position.accrued_rewards;
+        position.amount = position.amount.checked_add(compounded).expect("compound overflow");
+        position.accrued_rewards = 0;
+
         env.storage()
             .persistent()
-            .get(&StakingDataKey::PoolCapacity(asset_id))
+            .set(&StakingDataKey::Position(asset_id, staker.clone()), &position);
+
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&StakingDataKey::TotalStaked(asset_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StakingDataKey::TotalStaked(asset_id), &(total + compounded));
+
+        // Update strategy performance
+        let perf_key = StakingDataKey::StrategyPerf(asset_id, position.strategy.clone());
+        if let Some(mut perf) = env
+            .storage()
+            .persistent()
+            .get::<StakingDataKey, StrategyPerformance>(&perf_key)
+        {
+            perf.total_rewards_distributed = perf
+                .total_rewards_distributed
+                .checked_add(compounded)
+                .unwrap_or(perf.total_rewards_distributed);
+            perf.last_updated = now;
+            env.storage().persistent().set(&perf_key, &perf);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "rewards_compounded"), staker),
+            (asset_id, compounded),
+        );
     }
 
-    /// Get the current waitlist for a pool.
-    pub fn get_waitlist(env: Env, asset_id: u64) -> Vec<WaitlistEntry> {
+    /// Admin: enable or disable auto-compounding for an asset.
+    pub fn set_auto_compound(env: Env, admin: Address, asset_id: u64, enabled: bool) {
+        Self::require_admin(&env, &admin);
+        let mut config: RewardConfig = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::RewardConfig(asset_id))
+            .expect("rewards not configured for asset");
+        config.auto_compound = enabled;
         env.storage()
             .persistent()
-            .get(&StakingDataKey::Waitlist(asset_id))
-            .unwrap_or(Vec::new(&env))
+            .set(&StakingDataKey::RewardConfig(asset_id), &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "auto_compound_set"), asset_id),
+            enabled,
+        );
+    }
+
+    /// Get strategy performance metrics for an asset+strategy pair.
+    pub fn get_strategy_performance(
+        env: Env,
+        asset_id: u64,
+        strategy: StrategyType,
+    ) -> Option<StrategyPerformance> {
+        env.storage()
+            .persistent()
+            .get(&StakingDataKey::StrategyPerf(asset_id, strategy))
     }
 
     /// Get stake position for a staker.
@@ -685,11 +728,18 @@ impl StakingRewards {
         if elapsed < config.min_duration {
             return 0;
         }
-        // reward = amount * apr_bps / 10000 * elapsed / seconds_per_year
+        // Apply strategy-specific APR multiplier using integer arithmetic.
+        // Conservative = 0.8×, Balanced = 1.0×, Aggressive = 1.2×
+        let effective_apr: i128 = match position.strategy {
+            StrategyType::Conservative => config.apr_bps as i128 * 8 / 10,
+            StrategyType::Balanced => config.apr_bps as i128,
+            StrategyType::Aggressive => config.apr_bps as i128 * 12 / 10,
+        };
+        // reward = amount * effective_apr / 10000 * elapsed / seconds_per_year
         let seconds_per_year: i128 = 31_536_000;
         position
             .amount
-            .saturating_mul(config.apr_bps as i128)
+            .saturating_mul(effective_apr)
             / 10_000
             * elapsed as i128
             / seconds_per_year

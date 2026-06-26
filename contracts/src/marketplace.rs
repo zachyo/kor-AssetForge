@@ -918,6 +918,47 @@ impl Marketplace {
         assert!(listing.active, "listing not active");
         listing.active = false;
         env.storage().persistent().set(&MarketplaceDataKey::BundleListing(listing_id), &listing);
+        Self::append_audit_entry(&env, seller, Symbol::new(&env, "bundle_canceled"), listing.bundle_id, 0);
+    }
+
+    /// Update the price or discount on an active bundle listing.
+    pub fn update_bundle_listing(
+        env: Env,
+        seller: Address,
+        listing_id: u64,
+        new_price: i128,
+        new_discount_bps: u32,
+    ) {
+        seller.require_auth();
+        assert!(new_price > 0, "price must be positive");
+        assert!(new_discount_bps <= 10000, "discount must be <= 10000");
+
+        let mut listing: BundleListing = env.storage().persistent()
+            .get(&MarketplaceDataKey::BundleListing(listing_id))
+            .expect("bundle listing not found");
+        assert_eq!(listing.seller, seller, "only seller can update listing");
+        assert!(listing.active, "listing not active");
+
+        listing.price = new_price;
+        listing.discount_bps = new_discount_bps;
+        env.storage().persistent().set(&MarketplaceDataKey::BundleListing(listing_id), &listing);
+
+        Self::append_audit_entry(&env, seller, Symbol::new(&env, "bundle_listing_updated"), listing.bundle_id, new_price);
+    }
+
+    /// Return the effective (post-discount) price for a bundle listing.
+    pub fn get_discounted_bundle_price(env: Env, listing_id: u64) -> i128 {
+        let listing: BundleListing = env.storage().persistent()
+            .get(&MarketplaceDataKey::BundleListing(listing_id))
+            .expect("bundle listing not found");
+        if listing.discount_bps == 0 {
+            return listing.price;
+        }
+        let discount = listing.price
+            .checked_mul(listing.discount_bps as i128)
+            .expect("discount overflow")
+            / 10_000;
+        listing.price - discount
     }
 
     // -----------------------------------------------------------------------
