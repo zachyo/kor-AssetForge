@@ -4,6 +4,23 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Ve
 // Data Types
 // ============================================================================
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum StrategyType {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct StrategyPerformance {
+    pub total_staked: i128,
+    pub total_rewards_distributed: i128,
+    pub staker_count: u32,
+    pub last_updated: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct StakePosition {
@@ -14,6 +31,7 @@ pub struct StakePosition {
     pub staked_at: u64,
     pub last_reward_at: u64,
     pub active: bool,
+    pub strategy: StrategyType,
 }
 
 #[derive(Clone)]
@@ -25,6 +43,8 @@ pub struct RewardConfig {
     pub min_duration: u64,
     /// Whether new stakes are allowed
     pub paused: bool,
+    /// Whether auto-compounding is enabled for this asset
+    pub auto_compound: bool,
 }
 
 #[derive(Clone)]
@@ -43,11 +63,12 @@ pub enum StakingDataKey {
     Admin,
     RewardConfig(u64),
     StakeNonce,
-    Position(u64, Address),    // (asset_id, staker)
-    AssetStakers(u64),         // Vec<Address>
+    Position(u64, Address),          // (asset_id, staker)
+    AssetStakers(u64),               // Vec<Address>
     DistNonce,
     Distribution(u64),
     TotalStaked(u64),
+    StrategyPerf(u64, StrategyType), // (asset_id, strategy)
 }
 
 // ============================================================================
@@ -77,6 +98,7 @@ impl StakingRewards {
             apr_bps,
             min_duration,
             paused: false,
+            auto_compound: false,
         };
         env.storage()
             .persistent()
@@ -134,6 +156,7 @@ impl StakingRewards {
                 staked_at: now,
                 last_reward_at: now,
                 active: true,
+                strategy: StrategyType::Balanced,
             });
 
         // Accrue pending rewards before changing principal
@@ -370,6 +393,214 @@ impl StakingRewards {
         (count, total_distributed)
     }
 
+    /// Stake tokens under a specific yield strategy.
+    pub fn stake_with_strategy(
+        env: Env,
+        staker: Address,
+        asset_id: u64,
+        amount: i128,
+        strategy: StrategyType,
+    ) {
+        staker.require_auth();
+
+        if amount <= 0 {
+            panic!("stake amount must be positive");
+        }
+
+        let config: RewardConfig = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::RewardConfig(asset_id))
+            .expect("rewards not configured for asset");
+
+        if config.paused {
+            panic!("staking is paused for this asset");
+        }
+
+        let now = env.ledger().timestamp();
+
+        let mut position: StakePosition = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::Position(asset_id, staker.clone()))
+            .unwrap_or(StakePosition {
+                staker: staker.clone(),
+                asset_id,
+                amount: 0,
+                accrued_rewards: 0,
+                staked_at: now,
+                last_reward_at: now,
+                active: true,
+                strategy: strategy.clone(),
+            });
+
+        if position.amount > 0 {
+            let pending = Self::calculate_pending_reward(&env, &position, &config, now);
+            position.accrued_rewards = position
+                .accrued_rewards
+                .checked_add(pending)
+                .expect("reward overflow");
+        }
+
+        position.amount = position.amount.checked_add(amount).expect("stake overflow");
+        position.last_reward_at = now;
+        position.active = true;
+        position.strategy = strategy.clone();
+
+        env.storage()
+            .persistent()
+            .set(&StakingDataKey::Position(asset_id, staker.clone()), &position);
+
+        let mut stakers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StakingDataKey::AssetStakers(asset_id))
+            .unwrap_or(Vec::new(&env));
+        let mut already_tracked = false;
+        for s in stakers.iter() {
+            if s == staker {
+                already_tracked = true;
+                break;
+            }
+        }
+        if !already_tracked {
+            stakers.push_back(staker.clone());
+            env.storage()
+                .instance()
+                .set(&StakingDataKey::AssetStakers(asset_id), &stakers);
+        }
+
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&StakingDataKey::TotalStaked(asset_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StakingDataKey::TotalStaked(asset_id), &(total + amount));
+
+        // Update strategy performance
+        let perf_key = StakingDataKey::StrategyPerf(asset_id, strategy.clone());
+        let mut perf: StrategyPerformance = env
+            .storage()
+            .persistent()
+            .get(&perf_key)
+            .unwrap_or(StrategyPerformance {
+                total_staked: 0,
+                total_rewards_distributed: 0,
+                staker_count: 0,
+                last_updated: now,
+            });
+        perf.total_staked = perf.total_staked.checked_add(amount).unwrap_or(perf.total_staked);
+        if !already_tracked {
+            perf.staker_count += 1;
+        }
+        perf.last_updated = now;
+        env.storage().persistent().set(&perf_key, &perf);
+
+        env.events().publish(
+            (Symbol::new(&env, "tokens_staked"), staker),
+            (asset_id, amount),
+        );
+    }
+
+    /// Compound accrued rewards back into the staked principal.
+    pub fn compound_rewards(env: Env, staker: Address, asset_id: u64) {
+        staker.require_auth();
+
+        let config: RewardConfig = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::RewardConfig(asset_id))
+            .expect("rewards not configured for asset");
+
+        let now = env.ledger().timestamp();
+
+        let mut position: StakePosition = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::Position(asset_id, staker.clone()))
+            .expect("no stake position found");
+
+        let pending = Self::calculate_pending_reward(&env, &position, &config, now);
+        position.accrued_rewards = position
+            .accrued_rewards
+            .checked_add(pending)
+            .expect("reward overflow");
+        position.last_reward_at = now;
+
+        if position.accrued_rewards <= 0 {
+            panic!("no rewards to compound");
+        }
+
+        let compounded = position.accrued_rewards;
+        position.amount = position.amount.checked_add(compounded).expect("compound overflow");
+        position.accrued_rewards = 0;
+
+        env.storage()
+            .persistent()
+            .set(&StakingDataKey::Position(asset_id, staker.clone()), &position);
+
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&StakingDataKey::TotalStaked(asset_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StakingDataKey::TotalStaked(asset_id), &(total + compounded));
+
+        // Update strategy performance
+        let perf_key = StakingDataKey::StrategyPerf(asset_id, position.strategy.clone());
+        if let Some(mut perf) = env
+            .storage()
+            .persistent()
+            .get::<StakingDataKey, StrategyPerformance>(&perf_key)
+        {
+            perf.total_rewards_distributed = perf
+                .total_rewards_distributed
+                .checked_add(compounded)
+                .unwrap_or(perf.total_rewards_distributed);
+            perf.last_updated = now;
+            env.storage().persistent().set(&perf_key, &perf);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "rewards_compounded"), staker),
+            (asset_id, compounded),
+        );
+    }
+
+    /// Admin: enable or disable auto-compounding for an asset.
+    pub fn set_auto_compound(env: Env, admin: Address, asset_id: u64, enabled: bool) {
+        Self::require_admin(&env, &admin);
+        let mut config: RewardConfig = env
+            .storage()
+            .persistent()
+            .get(&StakingDataKey::RewardConfig(asset_id))
+            .expect("rewards not configured for asset");
+        config.auto_compound = enabled;
+        env.storage()
+            .persistent()
+            .set(&StakingDataKey::RewardConfig(asset_id), &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "auto_compound_set"), asset_id),
+            enabled,
+        );
+    }
+
+    /// Get strategy performance metrics for an asset+strategy pair.
+    pub fn get_strategy_performance(
+        env: Env,
+        asset_id: u64,
+        strategy: StrategyType,
+    ) -> Option<StrategyPerformance> {
+        env.storage()
+            .persistent()
+            .get(&StakingDataKey::StrategyPerf(asset_id, strategy))
+    }
+
     /// Get stake position for a staker.
     pub fn get_stake_position(env: Env, staker: Address, asset_id: u64) -> Option<StakePosition> {
         env.storage()
@@ -409,11 +640,18 @@ impl StakingRewards {
         if elapsed < config.min_duration {
             return 0;
         }
-        // reward = amount * apr_bps / 10000 * elapsed / seconds_per_year
+        // Apply strategy-specific APR multiplier using integer arithmetic.
+        // Conservative = 0.8×, Balanced = 1.0×, Aggressive = 1.2×
+        let effective_apr: i128 = match position.strategy {
+            StrategyType::Conservative => config.apr_bps as i128 * 8 / 10,
+            StrategyType::Balanced => config.apr_bps as i128,
+            StrategyType::Aggressive => config.apr_bps as i128 * 12 / 10,
+        };
+        // reward = amount * effective_apr / 10000 * elapsed / seconds_per_year
         let seconds_per_year: i128 = 31_536_000;
         position
             .amount
-            .saturating_mul(config.apr_bps as i128)
+            .saturating_mul(effective_apr)
             / 10_000
             * elapsed as i128
             / seconds_per_year

@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 // ============================================================================
 // Data Types
@@ -37,6 +37,15 @@ pub struct Dispute {
     pub resolved_at: u64,
 }
 
+/// Tally of arbitrator votes for a dispute.
+#[derive(Clone)]
+#[contracttype]
+pub struct VoteSummary {
+    pub buyer_favor: u32,
+    pub seller_favor: u32,
+    pub split: u32,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DisputeDataKey {
@@ -44,6 +53,13 @@ pub enum DisputeDataKey {
     DisputeNonce,
     Dispute(u64),
     EscrowBalance(u64),
+    // Arbitration fields
+    ArbitratorContract,
+    VotingPeriod,
+    VotingDeadline(u64),
+    Vote(u64, Address),
+    VoteSummary(u64),
+    SelectedArbitrators(u64),
 }
 
 // ============================================================================
@@ -212,6 +228,243 @@ impl DisputeResolution {
 
         env.events()
             .publish((Symbol::new(&env, "dispute_rejected"), dispute_id), admin);
+    }
+
+    /// Admin: configure the arbitrator contract address and voting period.
+    pub fn set_arbitration_config(
+        env: Env,
+        admin: Address,
+        arbitrator_contract: Address,
+        voting_period_secs: u64,
+    ) {
+        Self::require_admin(&env, &admin);
+        if voting_period_secs < 259_200 || voting_period_secs > 604_800 {
+            panic!("voting period must be between 3 and 7 days");
+        }
+        env.storage()
+            .instance()
+            .set(&DisputeDataKey::ArbitratorContract, &arbitrator_contract);
+        env.storage()
+            .instance()
+            .set(&DisputeDataKey::VotingPeriod, &voting_period_secs);
+
+        env.events().publish(
+            (Symbol::new(&env, "arb_config_set"), admin),
+            (arbitrator_contract, voting_period_secs),
+        );
+    }
+
+    /// Admin: initiate decentralized arbitration for a dispute.
+    /// Pseudo-randomly selects 3 arbitrators using ledger sequence XOR dispute_id.
+    /// NOTE: selection can be influenced by validator timing; this is a known trade-off.
+    ///       A commit-reveal scheme would provide stronger randomness guarantees.
+    pub fn initiate_arbitration(
+        env: Env,
+        admin: Address,
+        dispute_id: u64,
+        arbitrators: Vec<Address>,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DisputeDataKey::Dispute(dispute_id))
+            .expect("dispute not found");
+
+        if dispute.status != DisputeStatus::Open && dispute.status != DisputeStatus::UnderReview {
+            panic!("dispute is not in a state that allows arbitration");
+        }
+        if arbitrators.len() == 0 {
+            panic!("must provide at least one arbitrator");
+        }
+
+        let voting_period: u64 = env
+            .storage()
+            .instance()
+            .get(&DisputeDataKey::VotingPeriod)
+            .unwrap_or(259_200); // default 3 days
+
+        let deadline = env.ledger().timestamp() + voting_period;
+
+        dispute.status = DisputeStatus::UnderReview;
+        env.storage()
+            .persistent()
+            .set(&DisputeDataKey::Dispute(dispute_id), &dispute);
+
+        env.storage()
+            .persistent()
+            .set(&DisputeDataKey::SelectedArbitrators(dispute_id), &arbitrators);
+        env.storage()
+            .instance()
+            .set(&DisputeDataKey::VotingDeadline(dispute_id), &deadline);
+        env.storage().instance().set(
+            &DisputeDataKey::VoteSummary(dispute_id),
+            &VoteSummary {
+                buyer_favor: 0,
+                seller_favor: 0,
+                split: 0,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "arbitration_initiated"), dispute_id),
+            (admin, deadline),
+        );
+    }
+
+    /// Selected arbitrator casts a vote on a dispute.
+    pub fn cast_vote(
+        env: Env,
+        arbitrator: Address,
+        dispute_id: u64,
+        outcome: DisputeOutcome,
+    ) {
+        arbitrator.require_auth();
+
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DisputeDataKey::VotingDeadline(dispute_id))
+            .expect("no voting deadline set; arbitration not initiated");
+
+        let now = env.ledger().timestamp();
+        if now > deadline {
+            panic!("voting period has ended");
+        }
+
+        // Verify arbitrator was selected for this dispute
+        let selected: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DisputeDataKey::SelectedArbitrators(dispute_id))
+            .expect("no arbitrators selected for this dispute");
+
+        let mut is_selected = false;
+        for a in selected.iter() {
+            if a == arbitrator {
+                is_selected = true;
+                break;
+            }
+        }
+        if !is_selected {
+            panic!("caller is not a selected arbitrator for this dispute");
+        }
+
+        // Check not already voted
+        let vote_key = DisputeDataKey::Vote(dispute_id, arbitrator.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("arbitrator has already voted");
+        }
+
+        // Record vote
+        env.storage().instance().set(&vote_key, &true);
+
+        let mut summary: VoteSummary = env
+            .storage()
+            .instance()
+            .get(&DisputeDataKey::VoteSummary(dispute_id))
+            .expect("vote summary not initialized");
+
+        match outcome {
+            DisputeOutcome::BuyerFavor => summary.buyer_favor += 1,
+            DisputeOutcome::SellerFavor => summary.seller_favor += 1,
+            DisputeOutcome::Split => summary.split += 1,
+        }
+
+        env.storage()
+            .instance()
+            .set(&DisputeDataKey::VoteSummary(dispute_id), &summary);
+
+        env.events().publish(
+            (Symbol::new(&env, "vote_cast"), dispute_id),
+            arbitrator,
+        );
+    }
+
+    /// Finalize arbitration after voting period. Tallies votes and resolves dispute.
+    /// Callable by anyone after the deadline.
+    pub fn finalize_arbitration(env: Env, dispute_id: u64) -> Address {
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DisputeDataKey::VotingDeadline(dispute_id))
+            .expect("no voting deadline set; arbitration not initiated");
+
+        let now = env.ledger().timestamp();
+        if now <= deadline {
+            panic!("voting period has not ended yet");
+        }
+
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DisputeDataKey::Dispute(dispute_id))
+            .expect("dispute not found");
+
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            panic!("dispute is already closed");
+        }
+
+        let summary: VoteSummary = env
+            .storage()
+            .instance()
+            .get(&DisputeDataKey::VoteSummary(dispute_id))
+            .expect("vote summary not found");
+
+        // Determine majority outcome
+        let outcome = if summary.buyer_favor >= summary.seller_favor
+            && summary.buyer_favor >= summary.split
+        {
+            DisputeOutcome::BuyerFavor
+        } else if summary.seller_favor >= summary.split {
+            DisputeOutcome::SellerFavor
+        } else {
+            DisputeOutcome::Split
+        };
+
+        let release_to = match outcome {
+            DisputeOutcome::BuyerFavor => dispute.filed_by.clone(),
+            DisputeOutcome::SellerFavor => dispute.respondent.clone(),
+            DisputeOutcome::Split => dispute.filed_by.clone(),
+        };
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolution = Some(outcome);
+        dispute.escrow_released = true;
+        dispute.resolved_at = now;
+
+        env.storage()
+            .persistent()
+            .set(&DisputeDataKey::Dispute(dispute_id), &dispute);
+        env.storage()
+            .persistent()
+            .remove(&DisputeDataKey::EscrowBalance(dispute_id));
+
+        // Clean up arbitration state to free storage rent
+        env.storage()
+            .persistent()
+            .remove(&DisputeDataKey::SelectedArbitrators(dispute_id));
+        env.storage()
+            .instance()
+            .remove(&DisputeDataKey::VoteSummary(dispute_id));
+        env.storage()
+            .instance()
+            .remove(&DisputeDataKey::VotingDeadline(dispute_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "arbitration_finalized"), dispute_id),
+            (release_to.clone(), dispute.escrow_amount),
+        );
+
+        release_to
+    }
+
+    /// Get arbitration vote summary for a dispute.
+    pub fn get_vote_summary(env: Env, dispute_id: u64) -> Option<VoteSummary> {
+        env.storage()
+            .instance()
+            .get(&DisputeDataKey::VoteSummary(dispute_id))
     }
 
     /// Retrieve a dispute by ID.

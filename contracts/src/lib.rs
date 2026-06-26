@@ -17,6 +17,8 @@ pub mod upgradability;
 pub mod insurance;
 pub mod multisig;
 pub mod dividend_distributor;
+pub mod yield_strategy;
+pub mod arbitrator;
 
 pub use asset_token::AssetToken;
 pub use dividend_distributor::DividendDistributor;
