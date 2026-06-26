@@ -230,6 +230,27 @@ impl StakingRewards {
             .instance()
             .set(&StakingDataKey::TotalStaked(asset_id), &(total + amount));
 
+        // Update is_full flag in capacity config after staking (Issue #208)
+        if let Some(mut cap) = env
+            .storage()
+            .persistent()
+            .get::<_, PoolCapacity>(&StakingDataKey::PoolCapacity(asset_id))
+        {
+            if cap.max_capacity > 0 && !cap.is_full {
+                let new_total = total + amount;
+                if new_total >= cap.max_capacity {
+                    cap.is_full = true;
+                    env.storage()
+                        .persistent()
+                        .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
+                    env.events().publish(
+                        (Symbol::new(&env, "pool_at_capacity"), asset_id),
+                        cap.max_capacity,
+                    );
+                }
+            }
+        }
+
         env.events().publish(
             (Symbol::new(&env, "tokens_staked"), staker),
             (asset_id, amount),

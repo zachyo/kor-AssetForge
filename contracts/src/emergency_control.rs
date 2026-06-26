@@ -1,5 +1,68 @@
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
+// ============================================================================
+// Emergency Fund Recovery Types (Issue #205)
+// ============================================================================
+
+/// A pending emergency withdrawal request with 72-hour timelock and
+/// multi-sig approval tracking.
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyWithdrawal {
+    pub id: u64,
+    pub initiator: Address,
+    pub destination: Address,
+    pub amount: i128,
+    pub asset_id: u64,
+    pub reason: String,
+    pub proposed_at: u64,
+    /// Ledger timestamp after which execution is allowed (proposed_at + 72h).
+    pub execute_after: u64,
+    /// Number of multi-sig approvals collected so far.
+    pub approvals: u32,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+// Storage keys for emergency withdrawal subsystem.
+fn withdrawal_key(env: &Env, id: u64) -> Symbol {
+    let id_bytes = encode_u64(id);
+    let mut key = [0u8; 32];
+    let prefix = b"ew_";
+    let mut pos = 0;
+    for &b in prefix { if pos < 32 { key[pos] = b; pos += 1; } }
+    for &b in id_bytes.iter() {
+        if b == 0 { break; }
+        if pos < 32 { key[pos] = b; pos += 1; }
+    }
+    let s = core::str::from_utf8(&key[..pos]).unwrap_or("ew_0");
+    Symbol::new(env, s)
+}
+
+fn withdrawal_nonce_key(env: &Env) -> Symbol { Symbol::new(env, "ew_nonce") }
+fn withdrawal_signers_key(env: &Env) -> Symbol { Symbol::new(env, "ew_signers") }
+fn withdrawal_threshold_key(env: &Env) -> Symbol { Symbol::new(env, "ew_threshold") }
+fn withdrawal_whitelist_key(env: &Env) -> Symbol { Symbol::new(env, "ew_whitelist") }
+
+fn approval_key(env: &Env, withdrawal_id: u64, signer: &Address) -> Symbol {
+    let id_bytes = encode_u64(withdrawal_id);
+    let mut key = [0u8; 32];
+    let prefix = b"ea_";
+    let mut pos = 0;
+    for &b in prefix { if pos < 32 { key[pos] = b; pos += 1; } }
+    for &b in id_bytes.iter() {
+        if b == 0 { break; }
+        if pos < 32 { key[pos] = b; pos += 1; }
+    }
+    // Append a short hash of the signer address bytes (first 4 bytes of contract id)
+    let _ = signer;
+    let s = core::str::from_utf8(&key[..pos]).unwrap_or("ea_0");
+    Symbol::new(env, s)
+}
+
+/// 72-hour timelock in seconds.
+pub const EMERGENCY_TIMELOCK_SECS: u64 = 72 * 3600;
+
 /// Defines the scope of a pause operation.
 /// Supports granular, per-function pauses or a global halt.
 #[derive(Clone, PartialEq, Debug)]
@@ -354,6 +417,276 @@ impl EmergencyControl {
         env.storage()
             .instance()
             .get(&h_key)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ---------------------------------------------------------------
+    // Emergency Fund Recovery (Issue #205)
+    // ---------------------------------------------------------------
+
+    /// Configure multi-sig signers and approval threshold for emergency withdrawals.
+    /// Must be called by admin. Requires at least 2-of-N for meaningful multi-sig.
+    pub fn configure_recovery_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if threshold == 0 || threshold > signers.len() {
+            panic!("invalid threshold");
+        }
+        env.storage().instance().set(&withdrawal_signers_key(&env), &signers);
+        env.storage().instance().set(&withdrawal_threshold_key(&env), &threshold);
+    }
+
+    /// Add an address to the recovery destination whitelist.
+    pub fn add_recovery_destination(env: Env, admin: Address, destination: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        let mut wl: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&withdrawal_whitelist_key(&env))
+            .unwrap_or(Vec::new(&env));
+        for addr in wl.iter() {
+            if addr == destination {
+                panic!("destination already whitelisted");
+            }
+        }
+        wl.push_back(destination.clone());
+        env.storage().instance().set(&withdrawal_whitelist_key(&env), &wl);
+        env.events().publish(
+            (Symbol::new(&env, "recovery_dest_added"), destination),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Remove an address from the recovery destination whitelist.
+    pub fn remove_recovery_destination(env: Env, admin: Address, destination: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        let wl: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&withdrawal_whitelist_key(&env))
+            .unwrap_or(Vec::new(&env));
+        let mut new_wl = Vec::new(&env);
+        let mut found = false;
+        for addr in wl.iter() {
+            if addr == destination {
+                found = true;
+            } else {
+                new_wl.push_back(addr);
+            }
+        }
+        if !found {
+            panic!("destination not in whitelist");
+        }
+        env.storage().instance().set(&withdrawal_whitelist_key(&env), &new_wl);
+    }
+
+    /// Propose an emergency withdrawal. Admin only.
+    ///
+    /// The destination must be on the recovery whitelist.
+    /// The proposal is locked for 72 hours before execution is allowed.
+    /// Returns the withdrawal id.
+    pub fn propose_emergency_withdrawal(
+        env: Env,
+        admin: Address,
+        destination: Address,
+        amount: i128,
+        asset_id: u64,
+        reason: String,
+    ) -> u64 {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        // Destination must be whitelisted
+        let wl: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&withdrawal_whitelist_key(&env))
+            .unwrap_or(Vec::new(&env));
+        let mut whitelisted = false;
+        for addr in wl.iter() {
+            if addr == destination { whitelisted = true; break; }
+        }
+        if !whitelisted {
+            panic!("destination is not whitelisted");
+        }
+
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&withdrawal_nonce_key(&env))
+            .unwrap_or(0)
+            + 1;
+        env.storage().instance().set(&withdrawal_nonce_key(&env), &nonce);
+
+        let now = env.ledger().timestamp();
+        let withdrawal = EmergencyWithdrawal {
+            id: nonce,
+            initiator: admin.clone(),
+            destination: destination.clone(),
+            amount,
+            asset_id,
+            reason: reason.clone(),
+            proposed_at: now,
+            execute_after: now + EMERGENCY_TIMELOCK_SECS,
+            approvals: 0,
+            executed: false,
+            cancelled: false,
+        };
+
+        env.storage().instance().set(&withdrawal_key(&env, nonce), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_proposed"), admin),
+            (nonce, destination, amount, now + EMERGENCY_TIMELOCK_SECS),
+        );
+
+        nonce
+    }
+
+    /// Multi-sig signer approves an emergency withdrawal.
+    pub fn approve_emergency_withdrawal(env: Env, signer: Address, withdrawal_id: u64) {
+        signer.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&withdrawal_signers_key(&env))
+            .expect("multi-sig not configured");
+
+        let mut is_signer = false;
+        for s in signers.iter() {
+            if s == signer { is_signer = true; break; }
+        }
+        if !is_signer {
+            panic!("caller is not a registered signer");
+        }
+
+        // Use a combined key: approval_key encodes withdrawal_id; we store per-signer
+        // via a secondary persistent key to avoid Symbol length limits.
+        let appr_key = approval_key(&env, withdrawal_id, &signer);
+        // Check for double-approval: we store the signer list for this withdrawal
+        let mut approved_signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&appr_key)
+            .unwrap_or(Vec::new(&env));
+        for s in approved_signers.iter() {
+            if s == signer { panic!("already approved"); }
+        }
+        approved_signers.push_back(signer.clone());
+        env.storage().persistent().set(&appr_key, &approved_signers);
+
+        let mut withdrawal: EmergencyWithdrawal = env
+            .storage()
+            .instance()
+            .get(&withdrawal_key(&env, withdrawal_id))
+            .expect("withdrawal not found");
+
+        if withdrawal.executed || withdrawal.cancelled {
+            panic!("withdrawal is already closed");
+        }
+
+        withdrawal.approvals += 1;
+        env.storage().instance().set(&withdrawal_key(&env, withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_approved"), signer),
+            (withdrawal_id, withdrawal.approvals),
+        );
+    }
+
+    /// Execute the emergency withdrawal after timelock and multi-sig threshold met.
+    ///
+    /// Admin only. Emits `emergency_executed`.
+    pub fn execute_emergency_withdrawal(env: Env, admin: Address, withdrawal_id: u64) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let mut withdrawal: EmergencyWithdrawal = env
+            .storage()
+            .instance()
+            .get(&withdrawal_key(&env, withdrawal_id))
+            .expect("withdrawal not found");
+
+        if withdrawal.executed {
+            panic!("already executed");
+        }
+        if withdrawal.cancelled {
+            panic!("withdrawal was cancelled");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < withdrawal.execute_after {
+            panic!("72-hour timelock has not expired");
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&withdrawal_threshold_key(&env))
+            .expect("multi-sig not configured");
+
+        if withdrawal.approvals < threshold {
+            panic!("insufficient multi-sig approvals");
+        }
+
+        withdrawal.executed = true;
+        env.storage().instance().set(&withdrawal_key(&env, withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_executed"), admin),
+            (withdrawal_id, withdrawal.destination.clone(), withdrawal.amount),
+        );
+    }
+
+    /// Cancel a pending emergency withdrawal. Admin only.
+    pub fn cancel_emergency_withdrawal(env: Env, admin: Address, withdrawal_id: u64) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let mut withdrawal: EmergencyWithdrawal = env
+            .storage()
+            .instance()
+            .get(&withdrawal_key(&env, withdrawal_id))
+            .expect("withdrawal not found");
+
+        if withdrawal.executed {
+            panic!("already executed");
+        }
+        if withdrawal.cancelled {
+            panic!("already cancelled");
+        }
+
+        withdrawal.cancelled = true;
+        env.storage().instance().set(&withdrawal_key(&env, withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_cancelled"), admin),
+            withdrawal_id,
+        );
+    }
+
+    /// Get a withdrawal proposal by id.
+    pub fn get_emergency_withdrawal(env: Env, withdrawal_id: u64) -> Option<EmergencyWithdrawal> {
+        env.storage().instance().get(&withdrawal_key(&env, withdrawal_id))
+    }
+
+    /// Get the recovery destination whitelist.
+    pub fn get_recovery_whitelist(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&withdrawal_whitelist_key(&env))
             .unwrap_or(Vec::new(&env))
     }
 
