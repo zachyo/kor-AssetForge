@@ -492,6 +492,31 @@ func main() {
 			reportGroup.POST("/schedules/:id/run", reportHandler.RunSchedule)
 			reportGroup.GET("/history", reportHandler.ListHistory)
 		}
+
+		// Metadata version history routes (#195)
+		v1.GET("/assets/:id/metadata/versions", assetHandler.ListMetadataVersions)
+		v1.GET("/assets/:id/metadata/versions/:version", assetHandler.GetMetadataVersion)
+		protected.POST("/assets/:id/metadata/versions/:version/revert", assetHandler.RevertMetadataVersion)
+
+		// Fiat payment gateway routes (#196)
+		paymentHandler := handlers.NewPaymentHandler(db)
+		paymentGroup := protected.Group("/payments")
+		{
+			paymentGroup.POST("", paymentHandler.CreatePayment)
+			paymentGroup.GET("", paymentHandler.ListPayments)
+			paymentGroup.GET("/:id", paymentHandler.GetPayment)
+		}
+		router.POST("/payments/webhooks/:gateway", paymentHandler.HandleWebhook)
+		adminGroup.POST("/payments/reconcile", paymentHandler.ReconcilePayments)
+
+		// IP whitelist management routes (#194)
+		adminSecurityHandler := handlers.NewAdminSecurityHandler(db)
+		ipWhitelistGroup := adminGroup.Group("/security/ip-whitelist")
+		{
+			ipWhitelistGroup.POST("", adminSecurityHandler.AddIPWhitelistEntry)
+			ipWhitelistGroup.GET("", adminSecurityHandler.ListIPWhitelistEntries)
+			ipWhitelistGroup.DELETE("/:id", adminSecurityHandler.DeleteIPWhitelistEntry)
+		}
 	}
 
 	// API v2 routes (#124)

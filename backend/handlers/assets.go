@@ -23,19 +23,21 @@ import (
 )
 
 type AssetHandler struct {
-	db            *gorm.DB
-	stellarClient *utils.StellarClient
-	redisClient   *redis.Client
-	emailService  services.EmailService
-	workflow      *services.WorkflowService
+	db              *gorm.DB
+	stellarClient   *utils.StellarClient
+	redisClient     *redis.Client
+	emailService    services.EmailService
+	workflow        *services.WorkflowService
+	metadataService *services.MetadataService
 }
 
 func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClient *redis.Client, emailService services.EmailService, workflow ...*services.WorkflowService) *AssetHandler {
 	handler := &AssetHandler{
-		db:            db,
-		stellarClient: stellarClient,
-		redisClient:   redisClient,
-		emailService:  emailService,
+		db:              db,
+		stellarClient:   stellarClient,
+		redisClient:     redisClient,
+		emailService:    emailService,
+		metadataService: services.NewMetadataService(db),
 	}
 	if len(workflow) > 0 {
 		handler.workflow = workflow[0]
@@ -244,6 +246,9 @@ func (h *AssetHandler) ListTransactions(c *gin.Context) {
 	if queryParams.AssetID != 0 {
 		query = query.Where("asset_id = ?", queryParams.AssetID)
 	}
+	if queryParams.Memo != "" {
+		query = query.Where("memo ILIKE ?", "%"+queryParams.Memo+"%")
+	}
 
 	paginationRes, err := utils.Paginate(query, c, page, limit, &total, &transactions)
 	if err != nil {
@@ -420,6 +425,7 @@ func (h *AssetHandler) TransferAsset(c *gin.Context) {
 		Amount:      req.Amount,
 		TxHash:      txHash,
 		Status:      "pending",
+		Memo:        req.Memo,
 	}
 
 	if err := h.db.Create(&transaction).Error; err != nil {
@@ -462,6 +468,16 @@ func (h *AssetHandler) UpdateMetadata(c *gin.Context) {
 	if asset.IsImmutable {
 		apperrors.AbortWithError(c, apperrors.NewForbiddenError("Metadata is immutable after minting"))
 		return
+	}
+
+	// Snapshot current state before mutation so it can be reverted later.
+	changedBy, _ := c.Get("user_id")
+	var changedByID uint
+	if id, ok := changedBy.(uint); ok {
+		changedByID = id
+	}
+	if err := h.metadataService.RecordVersion(asset, changedByID, ""); err != nil {
+		log.Printf("Warning: failed to record metadata version for asset %d: %v", asset.ID, err)
 	}
 
 	asset.MetadataURI = req.MetadataURI
@@ -978,5 +994,100 @@ func (h *AssetHandler) ConvertCurrency(c *gin.Context) {
 		"to":        to,
 		"amount":    amount,
 		"converted": converted,
+	})
+}
+
+// ListMetadataVersions returns all recorded metadata versions for an asset.
+// GET /assets/:id/metadata/versions
+func (h *AssetHandler) ListMetadataVersions(c *gin.Context) {
+	var uri validator.AssetIDUri
+	if err := c.ShouldBindUri(&uri); err != nil {
+		apperrors.AbortWithError(c, apperrors.NewBadRequestError("Invalid asset ID"))
+		return
+	}
+
+	var asset models.Asset
+	if err := h.db.First(&asset, uri.ID).Error; err != nil {
+		apperrors.AbortWithError(c, apperrors.NewNotFoundError("Asset not found"))
+		return
+	}
+
+	versions, err := h.metadataService.ListVersions(uri.ID)
+	if err != nil {
+		apperrors.AbortWithError(c, apperrors.NewDatabaseError("Failed to fetch metadata versions", err))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"asset_id": uri.ID, "versions": versions})
+}
+
+// GetMetadataVersion returns a specific historical metadata version for an asset.
+// GET /assets/:id/metadata/versions/:version
+func (h *AssetHandler) GetMetadataVersion(c *gin.Context) {
+	var uri validator.AssetIDUri
+	if err := c.ShouldBindUri(&uri); err != nil {
+		apperrors.AbortWithError(c, apperrors.NewBadRequestError("Invalid asset ID"))
+		return
+	}
+
+	versionStr := c.Param("version")
+	versionNum, err := strconv.Atoi(versionStr)
+	if err != nil || versionNum < 1 {
+		apperrors.AbortWithError(c, apperrors.NewBadRequestError("Invalid version number"))
+		return
+	}
+
+	version, err := h.metadataService.GetVersion(uri.ID, versionNum)
+	if err != nil {
+		apperrors.AbortWithError(c, apperrors.NewNotFoundError("Metadata version not found"))
+		return
+	}
+
+	c.JSON(http.StatusOK, version)
+}
+
+// RevertMetadataVersion reverts an asset's metadata to a prior version.
+// POST /assets/:id/metadata/versions/:version/revert
+func (h *AssetHandler) RevertMetadataVersion(c *gin.Context) {
+	var uri validator.AssetIDUri
+	if err := c.ShouldBindUri(&uri); err != nil {
+		apperrors.AbortWithError(c, apperrors.NewBadRequestError("Invalid asset ID"))
+		return
+	}
+
+	versionStr := c.Param("version")
+	versionNum, err := strconv.Atoi(versionStr)
+	if err != nil || versionNum < 1 {
+		apperrors.AbortWithError(c, apperrors.NewBadRequestError("Invalid version number"))
+		return
+	}
+
+	var asset models.Asset
+	if err := h.db.First(&asset, uri.ID).Error; err != nil {
+		apperrors.AbortWithError(c, apperrors.NewNotFoundError("Asset not found"))
+		return
+	}
+
+	if asset.IsImmutable {
+		apperrors.AbortWithError(c, apperrors.NewForbiddenError("Metadata is immutable and cannot be reverted"))
+		return
+	}
+
+	revertedBy, _ := c.Get("user_id")
+	var revertedByID uint
+	if id, ok := revertedBy.(uint); ok {
+		revertedByID = id
+	}
+
+	if err := h.metadataService.RevertToVersion(&asset, versionNum, revertedByID); err != nil {
+		apperrors.AbortWithError(c, apperrors.NewInternalError("Failed to revert metadata"))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "Metadata reverted successfully",
+		"asset_id":      asset.ID,
+		"metadata_uri":  asset.MetadataURI,
+		"metadata_hash": asset.MetadataHash,
 	})
 }

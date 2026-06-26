@@ -72,6 +72,7 @@ type Transaction struct {
 	Amount      int64     `gorm:"not null" json:"amount"`
 	TxHash      string    `gorm:"uniqueIndex" json:"tx_hash"`
 	Status      string    `gorm:"default:'pending'" json:"status"` // pending, confirmed, failed
+	Memo        string    `gorm:"type:varchar(500)" json:"memo,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
