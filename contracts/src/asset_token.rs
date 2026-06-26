@@ -273,6 +273,20 @@ pub enum StakingError {
     Overflow = 4,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum MetadataError {
+    ImmutableMetadata = 1,
+    NotOwner = 2,
+    TimelockNotExpired = 3,
+    GovernanceRequired = 4,
+    GovernanceNotSet = 5,
+    UpdateNotFound = 6,
+    AlreadyExecuted = 7,
+    NotRequester = 8,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -331,6 +345,12 @@ pub enum DataKey {
     ExemptFromLimit(Address),
     // Multi-signature integration
     MultiSig,
+    // Controlled metadata update keys
+    AssetMetadata(u64),             // asset_id -> AssetMetadata
+    MetadataUpdateRequest(u64),     // request_id -> MetadataUpdateRequest
+    MetadataUpdateHistory(u64),     // asset_id -> Vec<MetadataUpdateRecord>
+    LastMetadataUpdateIndex,        // auto-incrementing update request IDs
+    MetadataGovernanceContract,     // address of the governance contract for immutable changes
 }
 
 #[derive(Clone)]
@@ -339,6 +359,64 @@ pub struct Staked {
     pub amount: i128,
     pub start_time: u64,
     pub accumulated_yields: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MetadataAttribute {
+    pub trait_type: String,
+    pub value: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AssetMetadata {
+    pub name: String,
+    pub description: String,
+    pub symbol: String,
+    pub image_uri: String,
+    pub external_url: String,
+    pub attributes: Vec<MetadataAttribute>,
+    pub is_immutable: bool,
+    pub version: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+#[contracttype]
+pub enum MetadataUpdateStatus {
+    Pending = 1,
+    Approved = 2,
+    Rejected = 3,
+    Executed = 4,
+    Cancelled = 5,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MetadataUpdateRequest {
+    pub request_id: u64,
+    pub asset_id: u64,
+    pub requester: Address,
+    pub old_metadata: AssetMetadata,
+    pub new_metadata: AssetMetadata,
+    pub created_at: u64,
+    pub timelock_until: u64,
+    pub status: MetadataUpdateStatus,
+    pub requires_governance: bool,
+    pub governance_proposal_id: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MetadataUpdateRecord {
+    pub version: u64,
+    pub old_metadata: AssetMetadata,
+    pub new_metadata: AssetMetadata,
+    pub updated_by: Address,
+    pub updated_at: u64,
+    pub update_type: u32, // 0 = owner_update, 1 = governance_update
 }
 
 const ANNUAL_YIELD_RATE: i128 = 500; // 500 basis points = 5%
@@ -1689,6 +1767,278 @@ impl AssetToken {
             .expect("Verifier not found");
         verifier_info.is_active = false;
         env.storage().instance().set(&DataKey::Verifier(verifier), &verifier_info);
+    }
+
+    // Controlled Metadata Update Functions
+    // -----------------------------------------------------------------------
+
+    /// Set initial metadata for an asset (only by asset owner)
+    pub fn set_asset_metadata(
+        env: Env,
+        owner: Address,
+        asset_id: u64,
+        name: String,
+        description: String,
+        symbol: String,
+        image_uri: String,
+        external_url: String,
+    ) {
+        owner.require_auth();
+
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
+        assert_eq!(asset.owner, owner, "not owner");
+
+        assert!(!env.storage().persistent().has(&DataKey::AssetMetadata(asset_id)), "metadata already set");
+
+        let now = env.ledger().timestamp();
+        let metadata = AssetMetadata {
+            name,
+            description,
+            symbol,
+            image_uri,
+            external_url,
+            attributes: Vec::new(&env),
+            is_immutable: false,
+            version: 1,
+            updated_at: now,
+        };
+
+        env.storage().persistent().set(&DataKey::AssetMetadata(asset_id), &metadata);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_set"), asset_id),
+            metadata.version,
+        );
+    }
+
+    /// Get asset metadata
+    pub fn get_asset_metadata(env: Env, asset_id: u64) -> Option<AssetMetadata> {
+        env.storage().persistent().get(&DataKey::AssetMetadata(asset_id))
+    }
+
+    /// Set the governance contract address for immutable metadata changes
+    pub fn set_metadata_governance(env: Env, admin: Address, governance_id: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert_eq!(admin, stored_admin, "not admin");
+
+        env.storage().instance().set(&DataKey::MetadataGovernanceContract, &governance_id);
+        env.events().publish((Symbol::new(&env, "metadata_governance_set"),), governance_id);
+    }
+
+    /// Propose a metadata update with a 48-hour time-lock.
+    /// Owner can update mutable metadata; immutable metadata requires governance approval.
+    pub fn propose_metadata_update(
+        env: Env,
+        requester: Address,
+        asset_id: u64,
+        new_name: String,
+        new_description: String,
+        new_symbol: String,
+        new_image_uri: String,
+        new_external_url: String,
+    ) -> u64 {
+        requester.require_auth();
+
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
+        let old_metadata: AssetMetadata = env.storage().persistent().get(&DataKey::AssetMetadata(asset_id))
+            .expect("No metadata found for asset");
+
+        // If metadata is marked immutable, this must go through governance
+        if old_metadata.is_immutable {
+            let gov_contract: Option<Address> = env.storage().instance().get(&DataKey::MetadataGovernanceContract);
+            if gov_contract.is_none() {
+                panic!("Governance contract not set");
+            }
+            // Mark that governance approval is required - will be approved by governance contract
+        }
+
+        // Owner can update, or governance can approve for immutable metadata
+        let requires_governance = old_metadata.is_immutable;
+
+        if !requires_governance {
+            assert_eq!(asset.owner, requester, "not owner");
+        }
+
+        let now = env.ledger().timestamp();
+        let timelock_duration: u64 = 172800; // 48 hours in seconds
+        let timelock_until = now.checked_add(timelock_duration).expect("timelock overflow");
+
+        let request_id = env.storage().instance().get(&DataKey::LastMetadataUpdateIndex).unwrap_or(0u64) + 1;
+        env.storage().instance().set(&DataKey::LastMetadataUpdateIndex, &request_id);
+
+        let new_version = old_metadata.version.checked_add(1).expect("version overflow");
+
+        let new_metadata = AssetMetadata {
+            name: new_name,
+            description: new_description,
+            symbol: new_symbol,
+            image_uri: new_image_uri,
+            external_url: new_external_url,
+            attributes: old_metadata.attributes.clone(),
+            is_immutable: old_metadata.is_immutable,
+            version: new_version,
+            updated_at: 0,
+        };
+
+        let update_request = MetadataUpdateRequest {
+            request_id,
+            asset_id,
+            requester: requester.clone(),
+            old_metadata: old_metadata.clone(),
+            new_metadata,
+            created_at: now,
+            timelock_until,
+            status: MetadataUpdateStatus::Pending,
+            requires_governance,
+            governance_proposal_id: 0,
+        };
+
+        env.storage().persistent().set(&DataKey::MetadataUpdateRequest(request_id), &update_request);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_update_proposed"), request_id, asset_id),
+            (requester, timelock_until, requires_governance),
+        );
+
+        request_id
+    }
+
+    /// Approve a metadata update request via governance (for immutable metadata changes)
+    pub fn approve_metadata_update(env: Env, governance: Address, request_id: u64) {
+        governance.require_auth();
+
+        let gov_contract: Address = env.storage().instance().get(&DataKey::MetadataGovernanceContract)
+            .expect("Governance contract not set");
+        assert_eq!(governance, gov_contract, "not governance contract");
+
+        let mut request: MetadataUpdateRequest = env.storage().persistent()
+            .get(&DataKey::MetadataUpdateRequest(request_id))
+            .expect("Update request not found");
+
+        assert!(request.status == MetadataUpdateStatus::Pending, "request not pending");
+        assert!(request.requires_governance, "governance not required");
+
+        request.status = MetadataUpdateStatus::Approved;
+
+        env.storage().persistent().set(&DataKey::MetadataUpdateRequest(request_id), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_update_approved"), request_id, request.asset_id),
+            governance,
+        );
+    }
+
+    /// Cancel a pending metadata update (only by requester)
+    pub fn cancel_metadata_update(env: Env, requester: Address, request_id: u64) {
+        requester.require_auth();
+
+        let mut request: MetadataUpdateRequest = env.storage().persistent()
+            .get(&DataKey::MetadataUpdateRequest(request_id))
+            .expect("Update request not found");
+
+        assert!(request.status == MetadataUpdateStatus::Pending, "request not pending");
+        assert_eq!(request.requester, requester, "not requester");
+
+        request.status = MetadataUpdateStatus::Cancelled;
+
+        env.storage().persistent().set(&DataKey::MetadataUpdateRequest(request_id), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_update_cancelled"), request_id, request.asset_id),
+            requester,
+        );
+    }
+
+    /// Execute a metadata update after the time-lock has expired (or after governance approval)
+    pub fn execute_metadata_update(env: Env, request_id: u64) {
+        let mut request: MetadataUpdateRequest = env.storage().persistent()
+            .get(&DataKey::MetadataUpdateRequest(request_id))
+            .expect("Update request not found");
+
+        // Check status
+        if request.requires_governance {
+            assert!(request.status == MetadataUpdateStatus::Approved, "governance approval required");
+        } else {
+            assert!(request.status == MetadataUpdateStatus::Pending, "request not pending");
+        }
+
+        // Check time-lock
+        let now = env.ledger().timestamp();
+        assert!(now >= request.timelock_until, "timelock not expired");
+
+        // Update metadata
+        let mut new_metadata = request.new_metadata.clone();
+        new_metadata.updated_at = now;
+        env.storage().persistent().set(&DataKey::AssetMetadata(request.asset_id), &new_metadata);
+
+        // Record update history
+        let record = MetadataUpdateRecord {
+            version: new_metadata.version,
+            old_metadata: request.old_metadata.clone(),
+            new_metadata: new_metadata.clone(),
+            updated_by: request.requester.clone(),
+            updated_at: now,
+            update_type: if request.requires_governance { 1u32 } else { 0u32 },
+        };
+
+        let mut history: Vec<MetadataUpdateRecord> = env.storage().persistent()
+            .get(&DataKey::MetadataUpdateHistory(request.asset_id))
+            .unwrap_or(Vec::new(&env));
+        history.push_back(record);
+        env.storage().persistent().set(&DataKey::MetadataUpdateHistory(request.asset_id), &history);
+
+        // Mark request as executed
+        request.status = MetadataUpdateStatus::Executed;
+        env.storage().persistent().set(&DataKey::MetadataUpdateRequest(request_id), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_update_executed"), request_id, request.asset_id),
+            (new_metadata.version, now),
+        );
+    }
+
+    /// Get a metadata update request by ID
+    pub fn get_metadata_update_request(env: Env, request_id: u64) -> Option<MetadataUpdateRequest> {
+        env.storage().persistent().get(&DataKey::MetadataUpdateRequest(request_id))
+    }
+
+    /// Get metadata update history for an asset
+    pub fn get_metadata_update_history(env: Env, asset_id: u64) -> Vec<MetadataUpdateRecord> {
+        env.storage().persistent()
+            .get(&DataKey::MetadataUpdateHistory(asset_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Mark an asset's metadata as immutable (requires owner or governance)
+    pub fn set_metadata_immutable(env: Env, caller: Address, asset_id: u64) {
+        caller.require_auth();
+
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
+
+        // Owner or governance can set immutable
+        if caller != asset.owner {
+            let gov_contract: Option<Address> = env.storage().instance().get(&DataKey::MetadataGovernanceContract);
+            match gov_contract {
+                Some(gc) if caller == gc => {},
+                _ => panic!("not authorized to set immutable"),
+            }
+        }
+
+        let mut metadata: AssetMetadata = env.storage().persistent()
+            .get(&DataKey::AssetMetadata(asset_id))
+            .expect("No metadata found");
+
+        metadata.is_immutable = true;
+        metadata.version = metadata.version.checked_add(1).expect("version overflow");
+        metadata.updated_at = env.ledger().timestamp();
+
+        env.storage().persistent().set(&DataKey::AssetMetadata(asset_id), &metadata);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_immutable_set"), asset_id),
+            caller,
+        );
     }
 }
 
