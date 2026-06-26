@@ -38,6 +38,8 @@ pub enum GovDataKey {
     DelegatorsOf(Address),
     /// Maximum number of delegators allowed per delegatee (instance-level setting)
     DelegationLimit,
+    /// Metadata update proposal tracking: proposal_id -> request_id
+    MetadataProposal(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +576,170 @@ impl Governance {
                 .expect("overflow");
         }
         total
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata Update Governance (Issue #234)
+    // -----------------------------------------------------------------------
+
+    /// Create a governance proposal to authorize a metadata update.
+    /// Used when asset metadata is immutable and requires community approval.
+    ///
+    /// Returns the proposal_id.
+    pub fn create_metadata_update_proposal(
+        env: Env,
+        proposer: Address,
+        asset_id: u64,
+        metadata_request_id: u64,
+        description: String,
+        duration: u64,
+    ) -> u64 {
+        proposer.require_auth();
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&GovDataKey::TokenContract)
+            .expect("not initialized");
+
+        let deposit_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&GovDataKey::DepositAmount)
+            .unwrap_or(0);
+
+        let token_client = AssetTokenClient::new(&env, &token_addr);
+        let balance = token_client.balance(&proposer);
+        if balance < deposit_amount {
+            panic!("insufficient tokens for deposit");
+        }
+
+        let quorum: i128 = env
+            .storage()
+            .instance()
+            .get(&GovDataKey::Quorum)
+            .unwrap_or(0);
+
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&GovDataKey::NextProposalId)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&GovDataKey::NextProposalId, &(proposal_id.checked_add(1).unwrap()));
+
+        let end_time = env.ledger().timestamp().checked_add(duration).expect("timestamp overflow");
+
+        let proposal = Proposal {
+            proposal_id,
+            asset_id,
+            proposer: proposer.clone(),
+            description,
+            votes_for: 0,
+            votes_against: 0,
+            quorum_threshold: quorum,
+            end_time,
+            status: ProposalStatus::Active,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::Proposal(proposal_id), &proposal);
+
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::Depositor(proposal_id), &proposer);
+
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::Snapshot(proposal_id, proposer.clone()), &balance);
+
+        // Link governance proposal to metadata update request
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::MetadataProposal(proposal_id), &metadata_request_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_proposal_created"), proposal_id, asset_id),
+            ProposalCreatedEvent {
+                version: EVENT_VERSION,
+                proposer: proposer.clone(),
+                end_time,
+            },
+        );
+
+        proposal_id
+    }
+
+    /// Get the metadata update request ID associated with a governance proposal
+    pub fn get_metadata_request_id(env: Env, proposal_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&GovDataKey::MetadataProposal(proposal_id))
+    }
+
+    /// Tally and execute a metadata update proposal. If passed, invokes the
+    /// asset token contract to approve the pending metadata update.
+    pub fn tally_execute_metadata(env: Env, proposal_id: u64, asset_token_addr: Address) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&GovDataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+
+        if proposal.status != ProposalStatus::Active {
+            panic!("proposal already finalized");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.end_time {
+            panic!("voting period not ended");
+        }
+
+        let total_votes = proposal
+            .votes_for
+            .checked_add(proposal.votes_against)
+            .expect("overflow");
+
+        if total_votes >= proposal.quorum_threshold && proposal.votes_for > proposal.votes_against {
+            proposal.status = ProposalStatus::Passed;
+
+            // Approve the metadata update in the asset token contract
+            let metadata_request_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&GovDataKey::MetadataProposal(proposal_id))
+                .expect("no linked metadata request");
+
+            let gov_id = env.current_contract_address();
+            let at_client = AssetTokenClient::new(&env, &asset_token_addr);
+            at_client.approve_metadata_update(&gov_id, &metadata_request_id);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_executed"), proposal_id, proposal.asset_id),
+                ProposalFinalizedEvent {
+                    version: EVENT_VERSION,
+                    votes_for: proposal.votes_for,
+                    votes_against: proposal.votes_against,
+                },
+            );
+        } else {
+            proposal.status = ProposalStatus::Rejected;
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_rejected"), proposal_id, proposal.asset_id),
+                ProposalFinalizedEvent {
+                    version: EVENT_VERSION,
+                    votes_for: proposal.votes_for,
+                    votes_against: proposal.votes_against,
+                },
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::Proposal(proposal_id), &proposal);
     }
 
     // -----------------------------------------------------------------------
