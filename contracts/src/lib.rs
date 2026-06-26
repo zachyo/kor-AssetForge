@@ -1,9 +1,11 @@
 #![no_std]
 
+pub mod access_control;
 pub mod asset_token;
 pub mod asset_bundle;
 pub mod auction;
 pub mod bridge_security;
+pub mod bridge_validator;
 pub mod dispute_resolution;
 pub mod emergency_control;
 pub mod events;
@@ -19,6 +21,8 @@ pub mod multisig;
 pub mod dividend_distributor;
 
 pub use asset_token::AssetToken;
+pub use access_control::AccessControl;
+pub use bridge_validator::BridgeValidator;
 pub use dividend_distributor::DividendDistributor;
 pub use auction::AuctionHouse;
 pub use bridge_security::BridgeSecurity;
