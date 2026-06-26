@@ -222,6 +222,30 @@ fn history_key(env: &Env, asset_id: u64) -> Symbol {
     Symbol::new(env, s)
 }
 
+/// Circuit breaker: last recorded price for an asset.
+fn cb_price_key(env: &Env, asset_id: u64) -> Symbol {
+    let id_str = encode_u64(asset_id);
+    let mut key = [0u8; 32];
+    let prefix = b"cb_p_";
+    let mut pos = 0;
+    for &b in prefix { if pos < 32 { key[pos] = b; pos += 1; } }
+    for &b in id_str.iter() { if b == 0 { break; } if pos < 32 { key[pos] = b; pos += 1; } }
+    let s = core::str::from_utf8(&key[..pos]).unwrap_or("cb_p_0");
+    Symbol::new(env, s)
+}
+
+/// Circuit breaker: timestamp of last price observation.
+fn cb_time_key(env: &Env, asset_id: u64) -> Symbol {
+    let id_str = encode_u64(asset_id);
+    let mut key = [0u8; 32];
+    let prefix = b"cb_t_";
+    let mut pos = 0;
+    for &b in prefix { if pos < 32 { key[pos] = b; pos += 1; } }
+    for &b in id_str.iter() { if b == 0 { break; } if pos < 32 { key[pos] = b; pos += 1; } }
+    let s = core::str::from_utf8(&key[..pos]).unwrap_or("cb_t_0");
+    Symbol::new(env, s)
+}
+
 /// Encode a u64 into a fixed-size byte array of ASCII digits.
 fn encode_u64(mut val: u64) -> [u8; 20] {
     let mut buf = [0u8; 20];
@@ -688,6 +712,124 @@ impl EmergencyControl {
             .instance()
             .get(&withdrawal_whitelist_key(&env))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ---------------------------------------------------------------
+    // Circuit Breaker (Issue #231)
+    // ---------------------------------------------------------------
+
+    /// Record a price observation for an asset.  If the price has dropped by
+    /// more than 50% within the last hour the circuit breaker trips and the
+    /// asset is automatically paused for `PauseScope::Trading`.
+    ///
+    /// Returns `true` if the breaker tripped.
+    pub fn record_price(env: Env, admin: Address, asset_id: u64, price: i128) -> bool {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if price <= 0 {
+            panic!("price must be positive");
+        }
+
+        let now = env.ledger().timestamp();
+        let price_key = cb_price_key(&env, asset_id);
+        let time_key = cb_time_key(&env, asset_id);
+
+        let prev_price: Option<i128> = env.storage().instance().get(&price_key);
+        let prev_time: Option<u64> = env.storage().instance().get(&time_key);
+
+        // Persist current observation
+        env.storage().instance().set(&price_key, &price);
+        env.storage().instance().set(&time_key, &now);
+
+        // Trip if price dropped >50% within 1 hour
+        if let (Some(prev), Some(t)) = (prev_price, prev_time) {
+            let elapsed = now.saturating_sub(t);
+            if elapsed <= 3600 && prev > 0 {
+                // price dropped by more than 50%: price < prev / 2
+                if price * 2 < prev {
+                    // Trip breaker: pause trading
+                    let flag_key = pause_flag_key(&env, asset_id, &PauseScope::Trading);
+                    let already_paused: bool =
+                        env.storage().instance().get(&flag_key).unwrap_or(false);
+                    if !already_paused {
+                        env.storage().instance().set(&flag_key, &true);
+                        // Set auto-unpause after cooldown (1 hour = ~720 ledgers approx)
+                        let cooldown_ledger = env.ledger().sequence() + 720;
+                        let au_key = auto_unpause_key(&env, asset_id, &PauseScope::Trading);
+                        env.storage().instance().set(&au_key, &cooldown_ledger);
+
+                        let reason = String::from_str(&env, "circuit_breaker_price_crash");
+                        let record = PauseRecord {
+                            asset_id,
+                            admin: admin.clone(),
+                            scope: PauseScope::Trading,
+                            reason,
+                            ledger_timestamp: env.ledger().sequence(),
+                            is_pause: true,
+                        };
+                        Self::append_history(&env, asset_id, record);
+                        env.events().publish(
+                            (Symbol::new(&env, "circuit_breaker_tripped"), asset_id),
+                            (prev, price, now),
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Record a volume spike observation.  If `volume` exceeds `threshold`
+    /// the circuit breaker trips and pauses trading for this asset.
+    pub fn record_volume(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        volume: i128,
+        threshold: i128,
+    ) -> bool {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if threshold <= 0 {
+            panic!("threshold must be positive");
+        }
+
+        if volume > threshold {
+            let flag_key = pause_flag_key(&env, asset_id, &PauseScope::Trading);
+            let already_paused: bool =
+                env.storage().instance().get(&flag_key).unwrap_or(false);
+            if !already_paused {
+                env.storage().instance().set(&flag_key, &true);
+                let cooldown_ledger = env.ledger().sequence() + 720;
+                let au_key = auto_unpause_key(&env, asset_id, &PauseScope::Trading);
+                env.storage().instance().set(&au_key, &cooldown_ledger);
+
+                let reason = String::from_str(&env, "circuit_breaker_volume_spike");
+                let record = PauseRecord {
+                    asset_id,
+                    admin: admin.clone(),
+                    scope: PauseScope::Trading,
+                    reason,
+                    ledger_timestamp: env.ledger().sequence(),
+                    is_pause: true,
+                };
+                Self::append_history(&env, asset_id, record);
+                env.events().publish(
+                    (Symbol::new(&env, "circuit_breaker_tripped"), asset_id),
+                    (volume, threshold),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Manual unpause by admin (requires explicit approval intent for circuit-breaker pauses).
+    /// Delegates to `unpause_asset` for the Trading scope.
+    pub fn circuit_breaker_unpause(env: Env, admin: Address, asset_id: u64) {
+        // reuse existing unpause logic
+        Self::unpause_asset(env, admin, asset_id, PauseScope::Trading);
     }
 
     // ---------------------------------------------------------------

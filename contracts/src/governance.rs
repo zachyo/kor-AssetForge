@@ -38,8 +38,12 @@ pub enum GovDataKey {
     DelegatorsOf(Address),
     /// Maximum number of delegators allowed per delegatee (instance-level setting)
     DelegationLimit,
-    /// Metadata update proposal tracking: proposal_id -> request_id
-    MetadataProposal(u64),
+    /// On-demand balance snapshot: snapshot_id -> taker address -> balance
+    BalanceSnapshot(u64, Address),
+    /// Snapshot metadata: snapshot_id -> expiry timestamp
+    SnapshotExpiry(u64),
+    /// Next snapshot id counter
+    NextSnapshotId,
 }
 
 // ---------------------------------------------------------------------------
@@ -579,167 +583,134 @@ impl Governance {
     }
 
     // -----------------------------------------------------------------------
-    // Metadata Update Governance (Issue #234)
+    // Snapshot-based Voting (Issue #230)
     // -----------------------------------------------------------------------
 
-    /// Create a governance proposal to authorize a metadata update.
-    /// Used when asset metadata is immutable and requires community approval.
-    ///
-    /// Returns the proposal_id.
-    pub fn create_metadata_update_proposal(
-        env: Env,
-        proposer: Address,
-        asset_id: u64,
-        metadata_request_id: u64,
-        description: String,
-        duration: u64,
-    ) -> u64 {
-        proposer.require_auth();
+    /// Create an on-demand balance snapshot for the caller.
+    /// The snapshot records the caller's current token balance and is valid
+    /// for `ttl_seconds`.  Returns the new `snapshot_id`.
+    pub fn create_snapshot(env: Env, taker: Address, ttl_seconds: u64) -> u64 {
+        taker.require_auth();
 
         let token_addr: Address = env
             .storage()
             .instance()
             .get(&GovDataKey::TokenContract)
             .expect("not initialized");
+        let balance = AssetTokenClient::new(&env, &token_addr).balance(&taker);
 
-        let deposit_amount: i128 = env
+        let snapshot_id: u64 = env
             .storage()
             .instance()
-            .get(&GovDataKey::DepositAmount)
-            .unwrap_or(0);
-
-        let token_client = AssetTokenClient::new(&env, &token_addr);
-        let balance = token_client.balance(&proposer);
-        if balance < deposit_amount {
-            panic!("insufficient tokens for deposit");
-        }
-
-        let quorum: i128 = env
-            .storage()
-            .instance()
-            .get(&GovDataKey::Quorum)
-            .unwrap_or(0);
-
-        let proposal_id: u64 = env
-            .storage()
-            .instance()
-            .get(&GovDataKey::NextProposalId)
+            .get(&GovDataKey::NextSnapshotId)
             .unwrap_or(1);
         env.storage()
             .instance()
-            .set(&GovDataKey::NextProposalId, &(proposal_id.checked_add(1).unwrap()));
+            .set(&GovDataKey::NextSnapshotId, &(snapshot_id + 1));
 
-        let end_time = env.ledger().timestamp().checked_add(duration).expect("timestamp overflow");
-
-        let proposal = Proposal {
-            proposal_id,
-            asset_id,
-            proposer: proposer.clone(),
-            description,
-            votes_for: 0,
-            votes_against: 0,
-            quorum_threshold: quorum,
-            end_time,
-            status: ProposalStatus::Active,
-        };
-
+        let expiry = env.ledger().timestamp() + ttl_seconds;
         env.storage()
             .persistent()
-            .set(&GovDataKey::Proposal(proposal_id), &proposal);
-
+            .set(&GovDataKey::BalanceSnapshot(snapshot_id, taker.clone()), &balance);
         env.storage()
             .persistent()
-            .set(&GovDataKey::Depositor(proposal_id), &proposer);
-
-        env.storage()
-            .persistent()
-            .set(&GovDataKey::Snapshot(proposal_id, proposer.clone()), &balance);
-
-        // Link governance proposal to metadata update request
-        env.storage()
-            .persistent()
-            .set(&GovDataKey::MetadataProposal(proposal_id), &metadata_request_id);
+            .set(&GovDataKey::SnapshotExpiry(snapshot_id), &expiry);
 
         env.events().publish(
-            (Symbol::new(&env, "metadata_proposal_created"), proposal_id, asset_id),
-            ProposalCreatedEvent {
-                version: EVENT_VERSION,
-                proposer: proposer.clone(),
-                end_time,
-            },
+            (Symbol::new(&env, "snapshot_created"), snapshot_id),
+            (taker, balance, expiry),
         );
 
-        proposal_id
+        snapshot_id
     }
 
-    /// Get the metadata update request ID associated with a governance proposal
-    pub fn get_metadata_request_id(env: Env, proposal_id: u64) -> Option<u64> {
+    /// Return the snapshotted balance for a given snapshot_id and address.
+    /// Panics if the snapshot has expired.
+    pub fn get_snapshot_balance(env: Env, snapshot_id: u64, user: Address) -> i128 {
+        let expiry: u64 = env
+            .storage()
+            .persistent()
+            .get(&GovDataKey::SnapshotExpiry(snapshot_id))
+            .expect("snapshot not found");
+        if env.ledger().timestamp() > expiry {
+            panic!("snapshot expired");
+        }
         env.storage()
             .persistent()
-            .get(&GovDataKey::MetadataProposal(proposal_id))
+            .get(&GovDataKey::BalanceSnapshot(snapshot_id, user))
+            .unwrap_or(0)
     }
 
-    /// Tally and execute a metadata update proposal. If passed, invokes the
-    /// asset token contract to approve the pending metadata update.
-    pub fn tally_execute_metadata(env: Env, proposal_id: u64, asset_token_addr: Address) {
+    /// Cast a vote using a pre-existing snapshot for off-chain / gasless
+    /// voting verification.  The snapshot must not be expired.
+    pub fn vote_with_snapshot(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        snapshot_id: u64,
+        vote_yes: bool,
+    ) {
+        voter.require_auth();
+
+        // Load and validate snapshot
+        let expiry: u64 = env
+            .storage()
+            .persistent()
+            .get(&GovDataKey::SnapshotExpiry(snapshot_id))
+            .expect("snapshot not found");
+        if env.ledger().timestamp() > expiry {
+            panic!("snapshot expired");
+        }
+        let weight: i128 = env
+            .storage()
+            .persistent()
+            .get(&GovDataKey::BalanceSnapshot(snapshot_id, voter.clone()))
+            .unwrap_or(0);
+        if weight <= 0 {
+            panic!("no balance in snapshot");
+        }
+
+        // Load proposal
         let mut proposal: Proposal = env
             .storage()
             .persistent()
             .get(&GovDataKey::Proposal(proposal_id))
             .expect("proposal not found");
-
         if proposal.status != ProposalStatus::Active {
-            panic!("proposal already finalized");
+            panic!("proposal not active");
         }
-
         let now = env.ledger().timestamp();
-        if now < proposal.end_time {
-            panic!("voting period not ended");
+        if now >= proposal.end_time {
+            panic!("proposal expired");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&GovDataKey::Voted(proposal_id, voter.clone()))
+        {
+            panic!("already voted");
         }
 
-        let total_votes = proposal
-            .votes_for
-            .checked_add(proposal.votes_against)
-            .expect("overflow");
-
-        if total_votes >= proposal.quorum_threshold && proposal.votes_for > proposal.votes_against {
-            proposal.status = ProposalStatus::Passed;
-
-            // Approve the metadata update in the asset token contract
-            let metadata_request_id: u64 = env
-                .storage()
-                .persistent()
-                .get(&GovDataKey::MetadataProposal(proposal_id))
-                .expect("no linked metadata request");
-
-            let gov_id = env.current_contract_address();
-            let at_client = AssetTokenClient::new(&env, &asset_token_addr);
-            at_client.approve_metadata_update(&gov_id, &metadata_request_id);
-
-            env.events().publish(
-                (Symbol::new(&env, "proposal_executed"), proposal_id, proposal.asset_id),
-                ProposalFinalizedEvent {
-                    version: EVENT_VERSION,
-                    votes_for: proposal.votes_for,
-                    votes_against: proposal.votes_against,
-                },
-            );
+        if vote_yes {
+            proposal.votes_for = proposal.votes_for.checked_add(weight).expect("overflow");
         } else {
-            proposal.status = ProposalStatus::Rejected;
-
-            env.events().publish(
-                (Symbol::new(&env, "proposal_rejected"), proposal_id, proposal.asset_id),
-                ProposalFinalizedEvent {
-                    version: EVENT_VERSION,
-                    votes_for: proposal.votes_for,
-                    votes_against: proposal.votes_against,
-                },
-            );
+            proposal.votes_against = proposal.votes_against.checked_add(weight).expect("overflow");
         }
 
         env.storage()
             .persistent()
+            .set(&GovDataKey::Voted(proposal_id, voter.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::Snapshot(proposal_id, voter.clone()), &weight);
+        env.storage()
+            .persistent()
             .set(&GovDataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "vote_cast_snapshot"), proposal_id),
+            (voter, vote_yes, weight, snapshot_id),
+        );
     }
 
     // -----------------------------------------------------------------------
