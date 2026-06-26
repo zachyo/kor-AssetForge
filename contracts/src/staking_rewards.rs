@@ -57,6 +57,26 @@ pub struct DistributionRecord {
     pub executed_at: u64,
 }
 
+/// Capacity configuration for a staking pool.
+#[derive(Clone)]
+#[contracttype]
+pub struct PoolCapacity {
+    /// Maximum total tokens that may be staked in this pool (0 = unlimited).
+    pub max_capacity: i128,
+    /// Whether the pool is currently at capacity.
+    pub is_full: bool,
+}
+
+/// A position in the FIFO waitlist for a full pool.
+#[derive(Clone)]
+#[contracttype]
+pub struct WaitlistEntry {
+    pub staker: Address,
+    pub asset_id: u64,
+    pub amount: i128,
+    pub queued_at: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum StakingDataKey {
@@ -142,6 +162,32 @@ impl StakingRewards {
             panic!("staking is paused for this asset");
         }
 
+        // Enforce capacity limit (Issue #208)
+        if let Some(mut cap) = env
+            .storage()
+            .persistent()
+            .get::<_, PoolCapacity>(&StakingDataKey::PoolCapacity(asset_id))
+        {
+            if cap.max_capacity > 0 {
+                let total: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&StakingDataKey::TotalStaked(asset_id))
+                    .unwrap_or(0);
+                if total >= cap.max_capacity {
+                    cap.is_full = true;
+                    env.storage()
+                        .persistent()
+                        .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
+                    env.events().publish(
+                        (Symbol::new(&env, "pool_at_capacity"), asset_id),
+                        (cap.max_capacity, staker.clone()),
+                    );
+                    panic!("pool is at capacity; join the waitlist");
+                }
+            }
+        }
+
         let now = env.ledger().timestamp();
 
         let mut position: StakePosition = env
@@ -205,6 +251,27 @@ impl StakingRewards {
             .instance()
             .set(&StakingDataKey::TotalStaked(asset_id), &(total + amount));
 
+        // Update is_full flag in capacity config after staking (Issue #208)
+        if let Some(mut cap) = env
+            .storage()
+            .persistent()
+            .get::<_, PoolCapacity>(&StakingDataKey::PoolCapacity(asset_id))
+        {
+            if cap.max_capacity > 0 && !cap.is_full {
+                let new_total = total + amount;
+                if new_total >= cap.max_capacity {
+                    cap.is_full = true;
+                    env.storage()
+                        .persistent()
+                        .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
+                    env.events().publish(
+                        (Symbol::new(&env, "pool_at_capacity"), asset_id),
+                        cap.max_capacity,
+                    );
+                }
+            }
+        }
+
         env.events().publish(
             (Symbol::new(&env, "tokens_staked"), staker),
             (asset_id, amount),
@@ -261,6 +328,27 @@ impl StakingRewards {
         env.storage()
             .instance()
             .set(&StakingDataKey::TotalStaked(asset_id), &(total - amount));
+
+        // Update capacity flag if pool was full (Issue #208)
+        if let Some(mut cap) = env
+            .storage()
+            .persistent()
+            .get::<_, PoolCapacity>(&StakingDataKey::PoolCapacity(asset_id))
+        {
+            if cap.is_full && cap.max_capacity > 0 {
+                let new_total = total - amount;
+                if new_total < cap.max_capacity {
+                    cap.is_full = false;
+                    env.storage()
+                        .persistent()
+                        .set(&StakingDataKey::PoolCapacity(asset_id), &cap);
+                    env.events().publish(
+                        (Symbol::new(&env, "pool_capacity_available"), asset_id),
+                        new_total,
+                    );
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "tokens_unstaked"), staker),
@@ -756,5 +844,127 @@ mod test {
         let pos = client.get_stake_position(&staker, &asset_id).unwrap();
         assert_eq!(pos.amount, 500_000);
         assert!(pos.active);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capacity & waitlist tests (Issue #208)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_pool_capacity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let asset_id: u64 = 10;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &5_000_000);
+
+        let cap = client.get_pool_capacity(&asset_id).unwrap();
+        assert_eq!(cap.max_capacity, 5_000_000);
+        assert!(!cap.is_full);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool is at capacity")]
+    fn test_stake_rejected_when_pool_full() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let staker1 = Address::generate(&env);
+        let staker2 = Address::generate(&env);
+        let asset_id: u64 = 11;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &1_000_000);
+        client.stake(&staker1, &asset_id, &1_000_000); // fills pool
+        client.stake(&staker2, &asset_id, &100_000);   // should panic
+    }
+
+    #[test]
+    fn test_waitlist_join_and_query() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let staker1 = Address::generate(&env);
+        let staker2 = Address::generate(&env);
+        let staker3 = Address::generate(&env);
+        let asset_id: u64 = 12;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &1_000_000);
+        client.stake(&staker1, &asset_id, &1_000_000); // fills pool
+
+        client.join_waitlist(&staker2, &asset_id, &500_000);
+        client.join_waitlist(&staker3, &asset_id, &300_000);
+
+        let wl = client.get_waitlist(&asset_id);
+        assert_eq!(wl.len(), 2);
+        // FIFO: staker2 is first
+        assert_eq!(wl.get(0).unwrap().staker, staker2);
+        assert_eq!(wl.get(1).unwrap().staker, staker3);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool is not full")]
+    fn test_join_waitlist_panics_when_pool_not_full() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let staker = Address::generate(&env);
+        let asset_id: u64 = 13;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &5_000_000);
+        client.join_waitlist(&staker, &asset_id, &100_000);
+    }
+
+    #[test]
+    fn test_rebalance_promotes_waitlist_after_unstake() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let staker1 = Address::generate(&env);
+        let staker2 = Address::generate(&env);
+        let asset_id: u64 = 14;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &1_000_000);
+        client.stake(&staker1, &asset_id, &1_000_000); // fills pool
+
+        client.join_waitlist(&staker2, &asset_id, &400_000);
+        assert_eq!(client.get_waitlist(&asset_id).len(), 1);
+
+        // Free up space
+        client.unstake(&staker1, &asset_id, &500_000);
+
+        // Rebalance should admit staker2
+        let promoted = client.rebalance_pool(&admin, &asset_id);
+        assert_eq!(promoted, 1);
+        assert_eq!(client.get_waitlist(&asset_id).len(), 0);
+
+        let pos = client.get_stake_position(&staker2, &asset_id).unwrap();
+        assert_eq!(pos.amount, 400_000);
+        assert!(pos.active);
+    }
+
+    #[test]
+    fn test_capacity_becomes_not_full_after_unstake() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let staker = Address::generate(&env);
+        let asset_id: u64 = 15;
+
+        client.configure_rewards(&admin, &asset_id, &500, &0);
+        client.set_pool_capacity(&admin, &asset_id, &1_000_000);
+        client.stake(&staker, &asset_id, &1_000_000);
+
+        let cap_full = client.get_pool_capacity(&asset_id).unwrap();
+        assert!(cap_full.is_full);
+
+        client.unstake(&staker, &asset_id, &200_000);
+        let cap_after = client.get_pool_capacity(&asset_id).unwrap();
+        assert!(!cap_after.is_full);
     }
 }

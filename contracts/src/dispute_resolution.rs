@@ -13,9 +13,13 @@ pub enum DisputeStatus {
     Rejected,
 }
 
+/// Outcome of a resolved dispute.
+/// Uses an extra `None` variant instead of `Option<DisputeOutcome>` for
+/// Soroban SDK contracttype compatibility.
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[contracttype]
 pub enum DisputeOutcome {
+    None,
     BuyerFavor,
     SellerFavor,
     Split,
@@ -30,7 +34,7 @@ pub struct Dispute {
     pub respondent: Address,
     pub reason: String,
     pub status: DisputeStatus,
-    pub resolution: Option<DisputeOutcome>,
+    pub resolution: DisputeOutcome,
     pub escrow_amount: i128,
     pub escrow_released: bool,
     pub created_at: u64,
@@ -112,7 +116,7 @@ impl DisputeResolution {
             respondent,
             reason,
             status: DisputeStatus::Open,
-            resolution: None,
+            resolution: DisputeOutcome::None,
             escrow_amount,
             escrow_released: false,
             created_at: env.ledger().timestamp(),
@@ -177,13 +181,14 @@ impl DisputeResolution {
         }
 
         let release_to = match resolution {
+            DisputeOutcome::None => panic!("resolution must be specified"),
             DisputeOutcome::BuyerFavor => dispute.filed_by.clone(),
             DisputeOutcome::SellerFavor => dispute.respondent.clone(),
             DisputeOutcome::Split => dispute.filed_by.clone(), // split handled off-chain
         };
 
         dispute.status = DisputeStatus::Resolved;
-        dispute.resolution = Some(resolution.clone());
+        dispute.resolution = resolution.clone();
         dispute.escrow_released = true;
         dispute.resolved_at = env.ledger().timestamp();
 
