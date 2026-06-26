@@ -89,6 +89,7 @@ pub enum StakingDataKey {
     Distribution(u64),
     TotalStaked(u64),
     StrategyPerf(u64, StrategyType), // (asset_id, strategy)
+    PoolCapacity(u64),               // (asset_id) -> PoolCapacity
 }
 
 // ============================================================================
