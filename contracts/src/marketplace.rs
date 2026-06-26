@@ -194,6 +194,11 @@ pub enum MarketplaceDataKey {
     Oracle,
     BundleListings,
     BundleListing(u64),
+    // --- Flash-loan protection (Issue #210) ---
+    /// Flash-loan guard configuration (instance-level).
+    FlashLoanGuard,
+    /// Per-buyer purchase counter for a given ledger (block): (buyer, ledger_seq) -> u32.
+    BlockTrades(Address, u32),
 }
 
 /// Storage keys for buy-back and burn system.
@@ -265,6 +270,22 @@ pub struct BuyBackRecord {
     pub executor: Address,
     /// Whether this was an auto-triggered buy-back
     pub auto_triggered: bool,
+}
+
+/// Flash-loan protection configuration for the marketplace (Issue #210).
+///
+/// Both limits default to the permissive value (`0`) so existing behaviour is
+/// unchanged until an admin opts in via `configure_flash_loan_guard`.
+#[derive(Clone)]
+#[contracttype]
+pub struct FlashLoanGuardConfig {
+    /// Maximum number of purchases a single buyer may perform within one ledger
+    /// (block). `0` disables the limit. Caps the atomic, same-block churn that
+    /// flash-loan style attacks rely on.
+    pub max_trades_per_block: u32,
+    /// Maximum allowed deviation (bps) between a listing price and the oracle
+    /// price on a guarded purchase. `0` disables the on-chain price check.
+    pub max_price_deviation_bps: u32,
 }
 
 // ============================================================================
@@ -380,6 +401,9 @@ impl Marketplace {
     ) -> bool {
         assert!(amount > 0, "amount must be positive");
         buyer.require_auth();
+
+        // Flash-loan guard: cap how many purchases a buyer can make per block.
+        Self::enforce_block_trade_limit(&env, &buyer);
 
         // Enforce pause check for trading operations
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
@@ -771,6 +795,91 @@ impl Marketplace {
                 panic!("user not whitelisted for private asset");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Flash-loan protection (Issue #210)
+    // -----------------------------------------------------------------------
+
+    /// Configure the marketplace flash-loan guard. Admin only.
+    ///
+    /// * `max_trades_per_block` – per-buyer purchase cap per ledger (0 = off).
+    /// * `max_price_deviation_bps` – max listing-vs-oracle deviation enforced by
+    ///   [`Marketplace::purchase_guarded`] (0 = off).
+    pub fn configure_flash_loan_guard(
+        env: Env,
+        admin: Address,
+        max_trades_per_block: u32,
+        max_price_deviation_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        let cfg = FlashLoanGuardConfig {
+            max_trades_per_block,
+            max_price_deviation_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&MarketplaceDataKey::FlashLoanGuard, &cfg);
+        env.events().publish(
+            (Symbol::new(&env, "flash_loan_guard_configured"),),
+            (max_trades_per_block, max_price_deviation_bps),
+        );
+    }
+
+    /// Return the active flash-loan guard configuration (defaults to permissive).
+    pub fn get_flash_loan_guard(env: Env) -> FlashLoanGuardConfig {
+        Self::flash_loan_guard(&env)
+    }
+
+    /// Purchase with both the per-block trade limit and an oracle price-deviation
+    /// check applied (Issue #210). Reverts if the listing price strays beyond the
+    /// configured deviation from the oracle, blocking price-manipulation exits.
+    pub fn purchase_guarded(
+        env: Env,
+        buyer: Address,
+        listing_id: u64,
+        amount: i128,
+        asset_id: u64,
+        emergency_control_id: Address,
+    ) -> bool {
+        let cfg = Self::flash_loan_guard(&env);
+        if cfg.max_price_deviation_bps > 0 {
+            let listing = Self::get_listing(env.clone(), listing_id).expect("listing not found");
+            assert!(
+                Self::validate_listing_price(
+                    env.clone(),
+                    asset_id,
+                    listing.price,
+                    cfg.max_price_deviation_bps
+                ),
+                "price deviates too much from oracle"
+            );
+        }
+        Self::purchase(env, buyer, listing_id, amount, asset_id, emergency_control_id)
+    }
+
+    fn flash_loan_guard(env: &Env) -> FlashLoanGuardConfig {
+        env.storage()
+            .instance()
+            .get(&MarketplaceDataKey::FlashLoanGuard)
+            .unwrap_or(FlashLoanGuardConfig {
+                max_trades_per_block: 0,
+                max_price_deviation_bps: 0,
+            })
+    }
+
+    fn enforce_block_trade_limit(env: &Env, buyer: &Address) {
+        let cfg = Self::flash_loan_guard(env);
+        if cfg.max_trades_per_block == 0 {
+            return;
+        }
+        let seq = env.ledger().sequence();
+        let key = MarketplaceDataKey::BlockTrades(buyer.clone(), seq);
+        let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if count >= cfg.max_trades_per_block {
+            panic!("per-block trade limit exceeded");
+        }
+        env.storage().persistent().set(&key, &(count + 1));
     }
 
     // -----------------------------------------------------------------------

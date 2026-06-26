@@ -44,6 +44,65 @@ pub enum GovDataKey {
     SnapshotExpiry(u64),
     /// Next snapshot id counter
     NextSnapshotId,
+    /// Current registered version for a given proposal template (Issue #211)
+    TemplateVersion(ProposalTemplate),
+    /// Template metadata attached to a proposal id (Issue #211)
+    TemplateMeta(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Governance Proposal Templates (Issue #211)
+// ---------------------------------------------------------------------------
+
+/// Pre-defined templates for common governance actions. Each template encodes
+/// the *shape* of a proposal so the front-end and validators can reason about
+/// the parameters without parsing free-form descriptions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[contracttype]
+pub enum ProposalTemplate {
+    /// Change a protocol fee (param_u64 = new fee in bps).
+    FeeChange,
+    /// Update a generic numeric protocol parameter (param_i128 = new value).
+    ParameterUpdate,
+    /// Upgrade a contract to new code (target = contract address).
+    ContractUpgrade,
+    /// Spend from the treasury (param_i128 = amount, target = recipient).
+    TreasurySpend,
+    /// Change the governance quorum threshold (param_i128 = new quorum).
+    QuorumChange,
+    /// List / approve an asset for trading (param_u64 = asset id).
+    AddAsset,
+    /// Delist / remove an asset (param_u64 = asset id).
+    RemoveAsset,
+    /// Toggle an emergency pause (param_u64 = scope id, param_i128 = 1 on / 0 off).
+    PauseToggle,
+    /// Change the per-delegatee delegation limit (param_u64 = new limit).
+    DelegationLimitChange,
+    /// Signaling-only text proposal (no executable parameters).
+    TextProposal,
+}
+
+/// Bounds applied to a template's parameters during validation.
+struct TemplateBounds {
+    /// Inclusive min / max for `param_u64` (when used).
+    u64_min: u64,
+    u64_max: u64,
+    /// Inclusive min / max for `param_i128` (when used).
+    i128_min: i128,
+    i128_max: i128,
+    /// Whether a non-`None` `target` address is required.
+    requires_target: bool,
+}
+
+/// Metadata recorded for a proposal created from a template.
+#[derive(Clone)]
+#[contracttype]
+pub struct TemplateProposal {
+    pub template: ProposalTemplate,
+    pub version: u32,
+    pub param_u64: u64,
+    pub param_i128: i128,
+    pub target: Option<Address>,
 }
 
 // ---------------------------------------------------------------------------
@@ -714,8 +773,233 @@ impl Governance {
     }
 
     // -----------------------------------------------------------------------
+    // Proposal Templates – Issue #211
+    // -----------------------------------------------------------------------
+
+    /// Register (or bump) the active version of a proposal template. Admin only.
+    /// Template versioning lets the protocol evolve a template's accepted
+    /// parameters while rejecting proposals built against a stale schema.
+    pub fn register_template_version(
+        env: Env,
+        admin: Address,
+        template: ProposalTemplate,
+        version: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if version == 0 {
+            panic!("template version must be >= 1");
+        }
+        env.storage()
+            .instance()
+            .set(&GovDataKey::TemplateVersion(template), &version);
+        env.events().publish(
+            (Symbol::new(&env, "template_version_set"),),
+            (template, version),
+        );
+    }
+
+    /// Return the currently registered version for a template (defaults to 1).
+    pub fn get_template_version(env: Env, template: ProposalTemplate) -> u32 {
+        env.storage()
+            .instance()
+            .get(&GovDataKey::TemplateVersion(template))
+            .unwrap_or(1)
+    }
+
+    /// Read-only validation of a set of template parameters. Returns `true` if
+    /// the version is current and every parameter is within bounds. Intended for
+    /// off-chain pre-flight checks before submitting a proposal.
+    pub fn validate_template_params(
+        env: Env,
+        template: ProposalTemplate,
+        version: u32,
+        param_u64: u64,
+        param_i128: i128,
+        target: Option<Address>,
+    ) -> bool {
+        if version != Self::get_template_version(env, template) {
+            return false;
+        }
+        let bounds = Self::template_bounds(&template);
+        Self::params_within_bounds(&bounds, param_u64, param_i128, &target)
+    }
+
+    /// Create a governance proposal from a pre-defined template (Issue #211).
+    ///
+    /// Validates the template version and enforces per-template parameter bounds
+    /// before delegating to [`Governance::create_proposal`] for the usual
+    /// deposit / snapshot / auth handling. The structured parameters are stored
+    /// alongside the proposal for later execution and indexing.
+    pub fn create_proposal_from_template(
+        env: Env,
+        proposer: Address,
+        template: ProposalTemplate,
+        version: u32,
+        param_u64: u64,
+        param_i128: i128,
+        target: Option<Address>,
+        description: String,
+        duration: u64,
+    ) -> u64 {
+        // Reject proposals built against an unsupported template schema.
+        if version != Self::get_template_version(env.clone(), template) {
+            panic!("unsupported template version");
+        }
+
+        let bounds = Self::template_bounds(&template);
+        if bounds.requires_target && target.is_none() {
+            panic!("template requires a target address");
+        }
+        if !Self::params_within_bounds(&bounds, param_u64, param_i128, &target) {
+            panic!("template parameters out of bounds");
+        }
+
+        // Asset-oriented templates feed their asset id through to the base
+        // proposal so a passing vote approves the right asset; all other
+        // templates use the neutral sentinel `0`.
+        let asset_id = match template {
+            ProposalTemplate::AddAsset | ProposalTemplate::RemoveAsset => param_u64,
+            _ => 0,
+        };
+
+        let proposal_id =
+            Self::create_proposal(env.clone(), proposer.clone(), asset_id, description, duration);
+
+        let meta = TemplateProposal {
+            template,
+            version,
+            param_u64,
+            param_i128,
+            target,
+        };
+        env.storage()
+            .persistent()
+            .set(&GovDataKey::TemplateMeta(proposal_id), &meta);
+
+        env.events().publish(
+            (Symbol::new(&env, "template_proposal_created"), proposal_id),
+            (proposer, template, version),
+        );
+
+        proposal_id
+    }
+
+    /// Return the template metadata attached to a proposal, if any.
+    pub fn get_template_proposal(env: Env, proposal_id: u64) -> Option<TemplateProposal> {
+        env.storage()
+            .persistent()
+            .get(&GovDataKey::TemplateMeta(proposal_id))
+    }
+
+    /// List every supported proposal template.
+    pub fn list_templates(env: Env) -> Vec<ProposalTemplate> {
+        let mut v = Vec::new(&env);
+        v.push_back(ProposalTemplate::FeeChange);
+        v.push_back(ProposalTemplate::ParameterUpdate);
+        v.push_back(ProposalTemplate::ContractUpgrade);
+        v.push_back(ProposalTemplate::TreasurySpend);
+        v.push_back(ProposalTemplate::QuorumChange);
+        v.push_back(ProposalTemplate::AddAsset);
+        v.push_back(ProposalTemplate::RemoveAsset);
+        v.push_back(ProposalTemplate::PauseToggle);
+        v.push_back(ProposalTemplate::DelegationLimitChange);
+        v.push_back(ProposalTemplate::TextProposal);
+        v
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Per-template parameter bounds. Centralises the limits enforced for every
+    /// template so validation stays consistent across entry points.
+    fn template_bounds(template: &ProposalTemplate) -> TemplateBounds {
+        match template {
+            // Fee expressed in bps; capped at 10% to prevent confiscatory fees.
+            ProposalTemplate::FeeChange => TemplateBounds {
+                u64_min: 0,
+                u64_max: 1_000,
+                i128_min: 0,
+                i128_max: 0,
+                requires_target: false,
+            },
+            ProposalTemplate::ParameterUpdate => TemplateBounds {
+                u64_min: 0,
+                u64_max: u64::MAX,
+                i128_min: 0,
+                i128_max: i128::MAX,
+                requires_target: false,
+            },
+            ProposalTemplate::ContractUpgrade => TemplateBounds {
+                u64_min: 0,
+                u64_max: u64::MAX,
+                i128_min: 0,
+                i128_max: 0,
+                requires_target: true,
+            },
+            ProposalTemplate::TreasurySpend => TemplateBounds {
+                u64_min: 0,
+                u64_max: u64::MAX,
+                i128_min: 1,
+                i128_max: i128::MAX,
+                requires_target: true,
+            },
+            ProposalTemplate::QuorumChange => TemplateBounds {
+                u64_min: 0,
+                u64_max: u64::MAX,
+                i128_min: 1,
+                i128_max: i128::MAX,
+                requires_target: false,
+            },
+            ProposalTemplate::AddAsset | ProposalTemplate::RemoveAsset => TemplateBounds {
+                u64_min: 1,
+                u64_max: u64::MAX,
+                i128_min: 0,
+                i128_max: 0,
+                requires_target: false,
+            },
+            // param_i128 acts as a boolean flag (0 = off, 1 = on).
+            ProposalTemplate::PauseToggle => TemplateBounds {
+                u64_min: 0,
+                u64_max: u64::MAX,
+                i128_min: 0,
+                i128_max: 1,
+                requires_target: false,
+            },
+            ProposalTemplate::DelegationLimitChange => TemplateBounds {
+                u64_min: 1,
+                u64_max: 10_000,
+                i128_min: 0,
+                i128_max: 0,
+                requires_target: false,
+            },
+            ProposalTemplate::TextProposal => TemplateBounds {
+                u64_min: 0,
+                u64_max: 0,
+                i128_min: 0,
+                i128_max: 0,
+                requires_target: false,
+            },
+        }
+    }
+
+    fn params_within_bounds(
+        bounds: &TemplateBounds,
+        param_u64: u64,
+        param_i128: i128,
+        target: &Option<Address>,
+    ) -> bool {
+        if param_u64 < bounds.u64_min || param_u64 > bounds.u64_max {
+            return false;
+        }
+        if param_i128 < bounds.i128_min || param_i128 > bounds.i128_max {
+            return false;
+        }
+        if bounds.requires_target && target.is_none() {
+            return false;
+        }
+        true
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
