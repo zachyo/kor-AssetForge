@@ -3,6 +3,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 use crate::governance::GovernanceClient;
 use crate::oracle::{OracleClient, AggregatedPrice};
+use crate::reputation::ReputationContractClient;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -205,6 +206,7 @@ pub enum BuyBackDataKey {
     TotalBurnedKey,
     HistoryKey,
     GovernanceContractKey,
+    ReputationContractKey,
 }
 
 /// Storage keys for the referral system.
@@ -390,6 +392,21 @@ impl Marketplace {
         if env.storage().instance().has(&BuyBackDataKey::BuyBackConfigKey) {
             let fee = Self::collect_fee(env.clone(), amount);
             Self::credit_referral_reward(&env, &buyer, fee);
+        }
+
+        // Record trade completion in reputation system if configured
+        if let Some(rep_addr) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&BuyBackDataKey::ReputationContractKey)
+        {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&BuyBackDataKey::BuyBackAdminKey)
+                .unwrap_or(buyer.clone());
+            let rep_client = ReputationContractClient::new(&env, &rep_addr);
+            rep_client.record_trade_completion(&admin, &buyer);
         }
 
         true
@@ -1457,6 +1474,15 @@ impl Marketplace {
 
         env.events()
             .publish((Symbol::new(&env, "burn_cap_updated"),), new_cap);
+    }
+
+    /// Set or update the reputation contract address. BBAdmin only.
+    pub fn set_reputation_contract(env: Env, admin: Address, reputation_contract: Address) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::ReputationContractKey, &reputation_contract);
     }
 
     /// Pause or unpause the buy-back system. BBAdmin only.
