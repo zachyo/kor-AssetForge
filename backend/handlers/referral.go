@@ -97,7 +97,7 @@ func (h *ReferralHandler) ListReferrals(c *gin.Context) {
 // tiered rewards. Admin-only.
 // POST /api/v1/admin/referrals/:refereeId/qualify
 func (h *ReferralHandler) QualifyReferral(c *gin.Context) {
-	refereeID, err := strconv.ParseUint(c.Param("refereeId"), 10, 64)
+	refereeID, err := strconv.ParseUint(c.Param("refereeId"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid referee id"})
 		return

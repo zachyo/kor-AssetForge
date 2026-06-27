@@ -69,7 +69,7 @@ func (h *ComparisonHandler) ListHistory(c *gin.Context) {
 // GET /api/v1/comparisons/history/:id
 func (h *ComparisonHandler) GetHistory(c *gin.Context) {
 	userID := currentUserID(c)
-	historyID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	historyID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid history id"})
 		return

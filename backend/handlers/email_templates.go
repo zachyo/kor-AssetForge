@@ -281,7 +281,7 @@ func (h *EmailTemplateHandler) Preview(c *gin.Context) {
 // CreateVariant adds an A/B testing variant to a template.
 // POST /api/v1/admin/email-templates/:id/variants
 func (h *EmailTemplateHandler) CreateVariant(c *gin.Context) {
-	templateID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	templateID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid template id"})
 		return
