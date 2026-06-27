@@ -39,7 +39,7 @@ export default function HomePage() {
     <div className="min-h-screen bg-background">
       <Header wallet={wallet} />
 
-      <main className="container mx-auto px-4 py-8">
+      <main id="main-content" className="container mx-auto px-4 py-8">
         <div className="text-center mb-12">
           <h1 className="text-4xl font-bold mb-4">kor-AssetForge</h1>
           <p className="text-xl text-muted-foreground mb-8">
