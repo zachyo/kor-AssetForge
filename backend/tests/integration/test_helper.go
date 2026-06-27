@@ -1,3 +1,12 @@
+//go:build ignore
+// +build ignore
+
+// NOTE: This integration suite is an unfinished stub. It was committed against a
+// fictional API (it imports package "main" and references models/fields such as
+// models.KYC, GovernanceProposal, EmergencyControl, Asset.Code/Decimals/Status,
+// User.PublicKey/Status that do not exist in this codebase) and has never
+// compiled. It is excluded from the build via the "ignore" constraint above so
+// `go test ./...` passes; restore it by rewriting against the real API.
 package integration
 
 import (

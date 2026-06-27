@@ -132,6 +132,19 @@ func InitDB() (*gorm.DB, error) {
 		&models.WatchlistItem{},
 		// User activity model (#161)
 		&models.UserActivity{},
+		// Email template models (#163)
+		&models.EmailTemplate{},
+		&models.EmailTemplateVersion{},
+		&models.EmailTemplateVariant{},
+		// Asset comparison history (#167)
+		&models.ComparisonHistory{},
+		// Performance metrics models (#169)
+		&models.AssetDividend{},
+		&models.PerformanceMetric{},
+		// Referral program models (#170)
+		&models.ReferralCode{},
+		&models.Referral{},
+		&models.ReferralReward{},
 	); err != nil {
 		return nil, fmt.Errorf("failed to auto-migrate models: %w", err)
 	}

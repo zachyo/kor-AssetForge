@@ -517,6 +517,53 @@ func main() {
 			ipWhitelistGroup.GET("", adminSecurityHandler.ListIPWhitelistEntries)
 			ipWhitelistGroup.DELETE("/:id", adminSecurityHandler.DeleteIPWhitelistEntry)
 		}
+
+		// Email template management routes (#163) — admin-only
+		emailTemplateHandler := handlers.NewEmailTemplateHandler(db)
+		emailTemplateAdmin := adminGroup.Group("/email-templates")
+		{
+			emailTemplateAdmin.GET("", emailTemplateHandler.ListTemplates)
+			emailTemplateAdmin.POST("", emailTemplateHandler.CreateTemplate)
+			emailTemplateAdmin.POST("/preview", emailTemplateHandler.Preview)
+			emailTemplateAdmin.POST("/render", emailTemplateHandler.RenderTemplate)
+			emailTemplateAdmin.GET("/:id", emailTemplateHandler.GetTemplate)
+			emailTemplateAdmin.PUT("/:id", emailTemplateHandler.UpdateTemplate)
+			emailTemplateAdmin.DELETE("/:id", emailTemplateHandler.DeleteTemplate)
+			emailTemplateAdmin.POST("/:id/activate", emailTemplateHandler.ActivateTemplate)
+			emailTemplateAdmin.GET("/:id/versions", emailTemplateHandler.ListVersions)
+			emailTemplateAdmin.GET("/:id/variants", emailTemplateHandler.ListVariants)
+			emailTemplateAdmin.POST("/:id/variants", emailTemplateHandler.CreateVariant)
+		}
+
+		// Asset comparison routes (#167)
+		comparisonHandler := handlers.NewComparisonHandler(db)
+		v1.POST("/comparisons", comparisonHandler.Compare)
+		comparisonGroup := protected.Group("/comparisons")
+		{
+			comparisonGroup.GET("/history", comparisonHandler.ListHistory)
+			comparisonGroup.GET("/history/:id", comparisonHandler.GetHistory)
+		}
+
+		// Asset performance metrics routes (#169)
+		valuationTracker := services.NewValuationTrackerService(db, redisClient)
+		analyticsHandler := handlers.NewAnalyticsHandler(db, valuationTracker)
+		metricsCalculator := services.NewMetricsCalculatorService(db)
+		metricsCalculator.Start(context.Background())
+		v1.GET("/assets/:id/performance", analyticsHandler.GetPerformanceMetrics)
+		v1.GET("/assets/:id/performance/history", analyticsHandler.GetPerformanceHistory)
+		adminGroup.POST("/assets/:id/performance/recalculate", analyticsHandler.RecalculatePerformance)
+		adminGroup.POST("/assets/:id/dividends", analyticsHandler.RecordDividend)
+
+		// User referral program routes (#170)
+		referralHandler := handlers.NewReferralHandler(db)
+		referralGroup := protected.Group("/referrals")
+		{
+			referralGroup.GET("", referralHandler.ListReferrals)
+			referralGroup.GET("/code", referralHandler.GetMyCode)
+			referralGroup.GET("/stats", referralHandler.GetStats)
+			referralGroup.POST("/apply", referralHandler.ApplyCode)
+		}
+		adminGroup.POST("/referrals/:refereeId/qualify", referralHandler.QualifyReferral)
 	}
 
 	// API v2 routes (#124)

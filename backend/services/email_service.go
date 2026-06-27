@@ -36,6 +36,22 @@ type EmailService interface {
 	SendTransactionConfirmation(toEmail, toName, txHash string, amount int64, assetID uint, fromAddress, toAddress string) error
 	SendApprovalPendingEmail(toEmail, toName string, requestID uint, expiresAt time.Time) error
 	SendScheduledReportEmail(recipients []string, reportName, format, fileName, body string) error
+	// SendCustomEmail queues an email with fully pre-rendered subject/body, used
+	// by the database-backed dynamic template engine (#163).
+	SendCustomEmail(toEmail, toName, subject, html, plainText string) error
+}
+
+// SendCustomEmail queues an arbitrary, already-rendered message. It powers the
+// customizable email-template system, which substitutes variables and selects
+// A/B variants before handing the finished content here for delivery.
+func (s *emailService) SendCustomEmail(toEmail, toName, subject, html, plainText string) error {
+	if strings.TrimSpace(toEmail) == "" {
+		return errors.New("recipient email is required")
+	}
+	if strings.TrimSpace(subject) == "" {
+		return errors.New("subject is required")
+	}
+	return s.queueEmail(&EmailMessage{To: toEmail, ToName: toName, Subject: subject, PlainText: plainText, HTML: html})
 }
 
 func (s *emailService) SendApprovalPendingEmail(toEmail, toName string, requestID uint, expiresAt time.Time) error {

@@ -121,15 +121,15 @@ func (s *RecommendationService) computeRecommendations(userID uint, limit int) (
 	}
 
 	var recommendations []models.AssetRecommendation
-	for _, s := range scored {
+	for _, sa := range scored {
 		var asset models.Asset
-		if err := s.db.First(&asset, s.AssetID).Error; err != nil {
+		if err := s.db.First(&asset, sa.AssetID).Error; err != nil {
 			continue
 		}
 		recommendations = append(recommendations, models.AssetRecommendation{
-			AssetID: s.AssetID,
+			AssetID: sa.AssetID,
 			Asset:   asset,
-			Score:   s.Score,
+			Score:   sa.Score,
 			Reason:  "Based on users with similar interests",
 		})
 	}
@@ -312,7 +312,7 @@ func (s *RecommendationService) explainRecommendation(assetID, userID uint) stri
 		return "Highly popular among similar investors"
 	}
 
-	purchaseCount := 0
+	var purchaseCount int64
 	s.db.Model(&models.UserInteraction{}).
 		Where("asset_id = ? AND interaction_type = ?", assetID, models.InteractionPurchase).
 		Count(&purchaseCount)

@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-//go:embed ../locales/*.json
+//go:embed locales/*.json
 var localeFiles embed.FS
 
 // DefaultLanguage is used whenever a request does not specify a supported language.
@@ -33,7 +33,7 @@ var (
 func New() (*Service, error) {
 	s := &Service{tables: make(map[string]map[string]string)}
 	for _, lang := range SupportedLanguages {
-		data, err := localeFiles.ReadFile("../locales/" + lang + ".json")
+		data, err := localeFiles.ReadFile("locales/" + lang + ".json")
 		if err != nil {
 			return nil, err
 		}
