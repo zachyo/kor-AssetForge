@@ -77,7 +77,7 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
     <div className={cn("space-y-4", className)}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <SlidersHorizontal className="h-4 w-4" />
+          <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
           <span className="font-semibold text-sm">Filters</span>
           {activeCount > 0 && (
             <Badge variant="secondary" className="text-xs">{activeCount}</Badge>
@@ -85,7 +85,7 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
         </div>
         {activeCount > 0 && (
           <Button variant="ghost" size="sm" onClick={clearAll} className="h-7 text-xs">
-            <RotateCcw className="h-3 w-3 mr-1" /> Clear
+            <RotateCcw className="h-3 w-3 mr-1" aria-hidden="true" /> Clear
           </Button>
         )}
       </div>
@@ -97,6 +97,8 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
             <Badge key={key} variant="secondary" className="gap-1 pr-1">
               <span className="text-xs">{FILTER_LABELS[key] || key}: {value}</span>
               <button
+                type="button"
+                aria-label={`Remove ${FILTER_LABELS[key] || key} filter`}
                 onClick={() => {
                   const next = { ...filters };
                   delete next[key];
@@ -104,7 +106,7 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
                 }}
                 className="ml-1 hover:bg-muted rounded-full p-0.5"
               >
-                <X className="h-3 w-3" />
+                <X className="h-3 w-3" aria-hidden="true" />
               </button>
             </Badge>
           ))}
@@ -114,18 +116,22 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
       {/* Price Range Filter */}
       <div>
         <button
+          type="button"
+          aria-expanded={!!expanded.price}
+          aria-controls="filter-section-price"
           className="flex items-center justify-between w-full text-sm font-medium mb-2"
           onClick={() => setExpanded((e) => ({ ...e, price: !e.price }))}
         >
           Price Range
-          {expanded.price ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+          {expanded.price ? <ChevronUp className="h-4 w-4" aria-hidden="true" /> : <ChevronDown className="h-4 w-4" aria-hidden="true" />}
         </button>
         {expanded.price && (
-          <div className="space-y-2 pl-1">
+          <div id="filter-section-price" className="space-y-2 pl-1">
             <div className="flex gap-2">
               <Input
                 type="number"
                 placeholder="Min"
+                aria-label="Minimum price"
                 value={priceMin}
                 onChange={(e) => setPriceMin(e.target.value)}
                 className="h-8 text-sm"
@@ -133,6 +139,7 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
               <Input
                 type="number"
                 placeholder="Max"
+                aria-label="Maximum price"
                 value={priceMax}
                 onChange={(e) => setPriceMax(e.target.value)}
                 className="h-8 text-sm"
@@ -152,17 +159,22 @@ export function FilterPanel({ filters, onFiltersChange, className }: FilterPanel
         return (
           <div key={facet.name}>
             <button
+              type="button"
+              aria-expanded={isExpanded}
+              aria-controls={`filter-section-${key}`}
               className="flex items-center justify-between w-full text-sm font-medium mb-2"
               onClick={() => setExpanded((e) => ({ ...e, [facet.name]: !isExpanded }))}
             >
               {facet.name}
-              {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+              {isExpanded ? <ChevronUp className="h-4 w-4" aria-hidden="true" /> : <ChevronDown className="h-4 w-4" aria-hidden="true" />}
             </button>
             {isExpanded && (
-              <div className="space-y-1 pl-1">
+              <div id={`filter-section-${key}`} className="space-y-1 pl-1">
                 {facet.values.map((v) => (
                   <button
                     key={v.value}
+                    type="button"
+                    aria-pressed={filters[key] === v.value}
                     onClick={() => toggleFilter(facet.name, v.value)}
                     className={cn(
                       "flex items-center justify-between w-full text-sm px-2 py-1.5 rounded-md transition-colors",

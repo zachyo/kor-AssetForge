@@ -184,11 +184,12 @@ export function FileUpload({
           type="file"
           multiple
           accept={accept}
+          aria-label={dropzoneText}
           onChange={handleInputChange}
           className="absolute inset-0 cursor-pointer opacity-0"
           disabled={disabled}
         />
-        <Upload className="mb-2 h-8 w-8 text-muted-foreground" />
+        <Upload className="mb-2 h-8 w-8 text-muted-foreground" aria-hidden="true" />
         <p className="mb-1 text-sm text-muted-foreground">{dropzoneText}</p>
         <p className="text-xs text-muted-foreground">
           {accept
@@ -198,16 +199,17 @@ export function FileUpload({
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          <AlertCircle className="h-4 w-4 shrink-0" />
+        <div role="alert" className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
           <span>{error}</span>
           <Button
             variant="ghost"
             size="icon"
             className="ml-auto h-5 w-5"
             onClick={() => setError(null)}
+            aria-label="Dismiss error"
           >
-            <X className="h-3 w-3" />
+            <X className="h-3 w-3" aria-hidden="true" />
           </Button>
         </div>
       )}
@@ -233,7 +235,7 @@ export function FileUpload({
                 )}
               </div>
               {uploadProgress[file.id] === 100 && (
-                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" aria-label="Upload complete" />
               )}
               <Button
                 variant="ghost"
@@ -241,8 +243,9 @@ export function FileUpload({
                 className="h-7 w-7 shrink-0"
                 onClick={() => removeFile(file.id)}
                 disabled={disabled}
+                aria-label={`Remove ${file.name}`}
               >
-                <X className="h-3.5 w-3.5" />
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
               </Button>
             </div>
           ))}

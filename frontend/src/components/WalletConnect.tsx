@@ -46,7 +46,7 @@ export function WalletConnect({ onWalletConnected, onWalletDisconnected, wallet 
       <Card className="w-full max-w-md">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Wallet className="h-5 w-5" />
+            <Wallet className="h-5 w-5" aria-hidden="true" />
             Wallet Connected
           </CardTitle>
           <CardDescription>
@@ -64,8 +64,9 @@ export function WalletConnect({ onWalletConnected, onWalletDisconnected, wallet 
             variant="outline" 
             className="w-full"
             disabled={isLoading}
+            aria-busy={isLoading}
           >
-            <LogOut className="h-4 w-4 mr-2" />
+            <LogOut className="h-4 w-4 mr-2" aria-hidden="true" />
             {isLoading ? 'Disconnecting...' : 'Disconnect'}
           </Button>
         </CardContent>
@@ -77,7 +78,7 @@ export function WalletConnect({ onWalletConnected, onWalletDisconnected, wallet 
     <Card className="w-full max-w-md">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Wallet className="h-5 w-5" />
+          <Wallet className="h-5 w-5" aria-hidden="true" />
           Connect Wallet
         </CardTitle>
         <CardDescription>
@@ -89,8 +90,9 @@ export function WalletConnect({ onWalletConnected, onWalletDisconnected, wallet 
           onClick={handleConnect} 
           className="w-full"
           disabled={isLoading}
+          aria-busy={isLoading}
         >
-          <Wallet className="h-4 w-4 mr-2" />
+          <Wallet className="h-4 w-4 mr-2" aria-hidden="true" />
           {isLoading ? 'Connecting...' : 'Connect Freighter Wallet'}
         </Button>
       </CardContent>
