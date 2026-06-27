@@ -109,22 +109,24 @@ export function Pagination({
         )}
       </div>
 
-      <nav className="flex items-center gap-1">
+      <nav className="flex items-center gap-1" aria-label="Pagination">
         <Button
           variant="outline"
           size="icon-xs"
           onClick={() => onPageChange(1)}
           disabled={currentPage === 1}
+          aria-label="Go to first page"
         >
-          <ChevronsLeft className="h-3.5 w-3.5" />
+          <ChevronsLeft className="h-3.5 w-3.5" aria-hidden="true" />
         </Button>
         <Button
           variant="outline"
           size="icon-xs"
           onClick={() => onPageChange(currentPage - 1)}
           disabled={currentPage === 1}
+          aria-label="Go to previous page"
         >
-          <ChevronLeft className="h-3.5 w-3.5" />
+          <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
         </Button>
 
         {range.map((page, index) => {
@@ -133,20 +135,24 @@ export function Pagination({
               <span
                 key={`dots-${index}`}
                 className="flex h-7 w-7 items-center justify-center"
+                aria-hidden="true"
               >
                 <MoreHorizontal className="h-3.5 w-3.5 text-muted-foreground" />
               </span>
             )
           }
 
+          const isCurrent = currentPage === page
           return (
             <Button
               key={page}
-              variant={currentPage === page ? "default" : "outline"}
+              variant={isCurrent ? "default" : "outline"}
               size="icon-xs"
               onClick={() => onPageChange(page as number)}
+              aria-label={`Go to page ${page}`}
+              aria-current={isCurrent ? "page" : undefined}
               className={cn(
-                currentPage === page && "pointer-events-none",
+                isCurrent && "pointer-events-none",
               )}
             >
               {page}
@@ -159,16 +165,18 @@ export function Pagination({
           size="icon-xs"
           onClick={() => onPageChange(currentPage + 1)}
           disabled={currentPage === totalPages}
+          aria-label="Go to next page"
         >
-          <ChevronRight className="h-3.5 w-3.5" />
+          <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
         </Button>
         <Button
           variant="outline"
           size="icon-xs"
           onClick={() => onPageChange(totalPages)}
           disabled={currentPage === totalPages}
+          aria-label="Go to last page"
         >
-          <ChevronsRight className="h-3.5 w-3.5" />
+          <ChevronsRight className="h-3.5 w-3.5" aria-hidden="true" />
         </Button>
       </nav>
     </div>

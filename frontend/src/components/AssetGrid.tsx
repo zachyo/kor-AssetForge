@@ -16,9 +16,13 @@ interface AssetGridProps {
 export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
   if (isLoading) {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div
+        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+        aria-busy="true"
+        aria-label="Loading assets"
+      >
         {[...Array(6)].map((_, i) => (
-          <Card key={i} className="animate-pulse">
+          <Card key={i} className="animate-pulse" aria-hidden="true">
             <CardHeader>
               <div className="h-4 bg-muted rounded w-3/4"></div>
               <div className="h-3 bg-muted rounded w-1/2"></div>
@@ -39,7 +43,7 @@ export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
   if (assets.length === 0) {
     return (
       <div className="text-center py-12">
-        <Building2 className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
+        <Building2 className="h-12 w-12 mx-auto text-muted-foreground mb-4" aria-hidden="true" />
         <h3 className="text-lg font-semibold mb-2">No Assets Available</h3>
         <p className="text-muted-foreground">
           {wallet 
@@ -52,13 +56,14 @@ export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+    <ul className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 list-none p-0" aria-label="Marketplace assets">
       {assets.map((asset) => (
-        <Card key={asset.id} className="hover:shadow-lg transition-shadow">
+        <li key={asset.id}>
+        <Card className="hover:shadow-lg transition-shadow">
           <CardHeader>
             <div className="flex items-start justify-between">
               <div className="flex items-center space-x-2">
-                <div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center">
+                <div className="h-10 w-10 rounded-lg bg-primary/10 flex items-center justify-center" aria-hidden="true">
                   <Building2 className="h-5 w-5 text-primary" />
                 </div>
                 <div>
@@ -69,7 +74,7 @@ export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
                 </div>
               </div>
               <div className="flex items-center text-sm text-muted-foreground">
-                <TrendingUp className="h-4 w-4 mr-1" />
+                <TrendingUp className="h-4 w-4 mr-1" aria-hidden="true" />
                 Active
               </div>
             </div>
@@ -101,7 +106,7 @@ export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
             <div className="flex space-x-2 pt-2">
               <Link href={`/assets/${asset.id}`} className="flex-1">
                 <Button variant="outline" className="w-full">
-                  <Eye className="h-4 w-4 mr-2" />
+                  <Eye className="h-4 w-4 mr-2" aria-hidden="true" />
                   View Details
                 </Button>
               </Link>
@@ -116,7 +121,8 @@ export function AssetGrid({ assets, isLoading, wallet }: AssetGridProps) {
             </div>
           </CardContent>
         </Card>
+        </li>
       ))}
-    </div>
+    </ul>
   )
 }

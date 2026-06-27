@@ -88,24 +88,30 @@ export function SearchBar({ onSearch, className, initialValue = "" }: SearchBarP
 
   return (
     <div ref={containerRef} className={cn("relative", className)}>
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} role="search">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" aria-hidden="true" />
           <Input
             ref={inputRef}
             type="text"
             placeholder="Search assets, tokens, locations..."
+            aria-label="Search assets, tokens, locations"
             value={query}
             onChange={(e) => { setQuery(e.target.value); setSelectedIndex(-1); }}
             onFocus={() => suggestions.length > 0 && setIsOpen(true)}
             onKeyDown={handleKeyDown}
             className="pl-9 pr-16"
+            role="combobox"
+            aria-expanded={isOpen && suggestions.length > 0}
+            aria-controls="search-suggestions"
+            aria-autocomplete="list"
+            aria-activedescendant={selectedIndex >= 0 ? `search-suggestion-${selectedIndex}` : undefined}
           />
           <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-            {isLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            {isLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />}
             {query && (
-              <Button type="button" variant="ghost" size="icon" className="h-6 w-6" onClick={() => { setQuery(""); onSearch(""); }}>
-                <X className="h-3 w-3" />
+              <Button type="button" variant="ghost" size="icon" className="h-6 w-6" onClick={() => { setQuery(""); onSearch(""); }} aria-label="Clear search">
+                <X className="h-3 w-3" aria-hidden="true" />
               </Button>
             )}
             <Button type="submit" size="sm" className="h-7">
@@ -116,22 +122,29 @@ export function SearchBar({ onSearch, className, initialValue = "" }: SearchBarP
       </form>
 
       {isOpen && suggestions.length > 0 && (
-        <div className="absolute top-full mt-1 w-full bg-popover border rounded-lg shadow-lg z-50 max-h-64 overflow-auto">
+        <ul
+          id="search-suggestions"
+          role="listbox"
+          aria-label="Search suggestions"
+          className="absolute top-full mt-1 w-full bg-popover border rounded-lg shadow-lg z-50 max-h-64 overflow-auto"
+        >
           {suggestions.map((s, i) => (
-            <button
-              key={i}
-              type="button"
-              className={cn(
-                "w-full text-left px-4 py-2.5 text-sm hover:bg-muted transition-colors flex items-center gap-2",
-                i === selectedIndex && "bg-muted"
-              )}
-              onClick={() => handleSelect(s)}
-            >
-              <Clock className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              <span>{s}</span>
-            </button>
+            <li key={i} role="option" aria-selected={i === selectedIndex} id={`search-suggestion-${i}`}>
+              <button
+                type="button"
+                tabIndex={-1}
+                className={cn(
+                  "w-full text-left px-4 py-2.5 text-sm hover:bg-muted transition-colors flex items-center gap-2",
+                  i === selectedIndex && "bg-muted"
+                )}
+                onClick={() => handleSelect(s)}
+              >
+                <Clock className="h-3.5 w-3.5 text-muted-foreground shrink-0" aria-hidden="true" />
+                <span>{s}</span>
+              </button>
+            </li>
           ))}
-        </div>
+        </ul>
       )}
     </div>
   );
